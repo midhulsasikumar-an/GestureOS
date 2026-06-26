@@ -1,15 +1,17 @@
 # Technical Requirements Document — GestureOS
 
 **Document Type:** Technical Requirements Document (TRD)
-**Source of Truth:** GestureOS PRD v1.2 (Final)
-**Version:** 1.1.0
+**Source of Truth:** GestureOS PRD v1.3 (Final)
+**Version:** 1.2.0
 **Audience:** Engineering team, AI coding agents, QA
 **Language/Runtime:** Python 3.11+
 **Date:** June 2026
 
-> **Document Scope:** This TRD translates GestureOS PRD v1.2 into an implementation blueprint. It does not introduce new product features and does not alter PRD requirements. Every functional and non-functional requirement, gesture rule, checkpoint, and acceptance criterion defined in the PRD — including all v1.2 additions (scale invariance, hand scale estimation, stability/cooldown, cursor smoothing, motion history, occlusion handling, primary hand selection, camera validation, lighting detection, context verification, calibration, performance budgets) — is treated as fixed. This document answers **HOW** the system is engineered to satisfy those requirements.
+> **Document Scope:** This TRD translates GestureOS PRD v1.3 into an implementation blueprint. It does not introduce new product features and does not alter PRD requirements. Every functional and non-functional requirement, gesture rule, checkpoint, and acceptance criterion defined in the PRD — including all v1.2 additions (scale invariance, hand scale estimation, stability/cooldown, cursor smoothing, motion history, occlusion handling, primary hand selection, camera validation, lighting detection, context verification, calibration, performance budgets) and v1.3 additions (Windows-primary platform scope, Multi-Signal Recognition, Conflict Resolution) — is treated as fixed. This document answers **HOW** the system is engineered to satisfy those requirements.
 >
 > **Changes from TRD v1.0:** This revision adds five new components (HandScaleEstimator, StabilityFilter, CooldownFilter, OcclusionHandler, CameraValidator/LightingMonitor), rewrites GestureEngine's internals around scale-invariant math, formalizes CursorController as its own component, adds the Context Verification Layer to ContextEngine, and adds a new Calibration subsystem. All TRD v1.0 components not mentioned as changed remain as previously specified.
+>
+> **Changes in TRD v1.2:** Re-scopes the Cross-Platform Strategy (§11) to Windows-primary: `WindowsContextAdapter` and `WindowsExecutor` are the only adapter/executor implementations built and validated for the initial release; macOS and Linux adapters/executors remain documented at the architectural/interface level for future-expansion readiness but are not implementation targets for this release. Adds a formal `ConflictResolver` component implementing PRD §4.6's Conflict Resolution stage. Documents the Multi-Signal Recognition discipline (PRD §4.5) as an explicit `GestureEngine` design constraint. No component contract for any already-shipped component is altered.
 
 ---
 
@@ -65,6 +67,9 @@ GestureOS is implemented as a single-process, multi-threaded Python desktop appl
 | Lighting quality detection | PRD §8.12 | **LightingMonitor** (new, inside diagnostics/) |
 | Calibration wizard | PRD §15 | **CalibrationManager** (new) + ui/calibration_wizard.py |
 | Performance budgets | PRD §16 | Enforced via profiling harness, Section 15 |
+| Multi-signal recognition discipline | PRD §4.5 (v1.3) | Existing per-gesture rules in StaticRecognizer/DynamicRecognizer documented against this explicit requirement; no code change, documentation/discipline formalization only |
+| Conflict resolution | PRD §4.6 (v1.3) | **ConflictResolver** (new, §3.9.1); GestureEngine candidate generation changed from first-match-wins to all-candidates |
+| Platform scope narrowing | PRD §1.2 (v1.3) | No component change — `ContextAdapter`/`CommandExecutor` ABC interfaces unchanged; only Windows implementations are in-scope for initial release (§11) |
 
 ### 1.3 Why This Stack (unchanged from v1.0)
 
@@ -131,7 +136,13 @@ GestureOS is implemented as a single-process, multi-threaded Python desktop appl
           ▼
 ┌──────────────────┐
 │ Gesture           │   GestureEngine.evaluate()
-│ Recognition       │   (scale-invariant static + motion-history dynamic)
+│ Recognition       │   (scale-invariant static + motion-history dynamic;
+│ (Candidate Gen.)  │    returns ALL qualifying candidates, v1.2)
+└─────────┬─────────┘
+          ▼
+┌──────────────────┐
+│ Conflict Resolver │   ConflictResolver.resolve()
+│                   │   (selects single winner per hand, v1.2 — PRD §4.6)
 └─────────┬─────────┘
           ▼
 ┌──────────────────┐
@@ -190,7 +201,8 @@ A single background `QThread` (`CaptureThread`) owns the camera loop and runs ev
 | Identity + Occlusion | HandIdentityModule, OcclusionHandler | `list[HandData]` (role-tagged, gap-bridged) |
 | Scale Estimation | HandScaleEstimator | `HandData.scale` populated |
 | Primary Hand Filter | PrimaryHandFilter | `list[HandData]` (filtered) |
-| Gesture Recognition | GestureEngine | `GestureResult \| None` |
+| Gesture Recognition | GestureEngine | `list[GestureResult]` (0–N candidates per hand, v1.2) |
+| Conflict Resolution | ConflictResolver | `list[GestureResult]` (≤1 per hand, v1.2 — PRD §4.6) |
 | Stability Filter | StabilityFilter | `GestureResult \| None` (held candidates only) |
 | Context + Verification | ContextEngine | `str` context id |
 | Action Mapping | ActionEngine | `Action \| None` |
@@ -471,13 +483,13 @@ class PrimaryHandFilter:
 
 ---
 
-### 3.9 GestureEngine *(rewritten in v1.2 around scale-invariant math)*
+### 3.9 GestureEngine *(rewritten in v1.2 around scale-invariant math; candidate generation updated in v1.2 per PRD §4.6 Conflict Resolution)*
 
 The recognition core. Evaluates static finger-state/angle rules and motion-history-buffered dynamic rules, all normalized against `HandData.scale.smoothed_scale`. See Section 4 for the complete rule implementations.
 
-- **Responsibilities:** compute per-finger EXTENDED/CURLED state via joint angle (PRD §5.3); evaluate static gesture rules using Priority 1→3 signals (finger state → angles → normalized distances); maintain the Motion History Buffer per hand role and evaluate dynamic rules using Priority 4 (normalized trajectories); return the single highest-confidence `GestureResult` candidate per hand per frame — confidence and cooldown/stability are applied downstream by `StabilityFilter` and `CooldownFilter`, not inside `GestureEngine` itself (this separation is new in v1.2 — v1.0 combined cooldown into the engine).
+- **Responsibilities:** compute per-finger EXTENDED/CURLED state via joint angle (PRD §5.3); evaluate static gesture rules using Priority 1→3 signals (finger state → angles → normalized distances); maintain the Motion History Buffer per hand role and evaluate dynamic rules using Priority 4 (normalized trajectories); return **every** rule match that clears `gesture_confidence_threshold` as a candidate per hand per frame (PRD §4.6 Candidate Generation stage) — selection among multiple candidates is no longer performed inside `GestureEngine` itself. `ConflictResolver` (§3.9.1), `StabilityFilter`, and `CooldownFilter` apply downstream, in that order (this separation was first introduced in v1.2 for stability/cooldown — v1.2 extends it further to explicitly separate candidate generation from candidate selection, per PRD §4.6).
 - **Inputs:** `list[HandData]` (role-tagged, scale-populated, gesture-eligible filtered), current timestamp.
-- **Outputs:** `list[GestureResult]` (0–2 entries, one per gesture-eligible hand, raw candidates — not yet stability- or cooldown-filtered).
+- **Outputs:** `list[GestureResult]` (0–N entries per hand — **not capped at one per hand**, since multiple rules may independently match in the same frame; this is the PRD §4.6 Candidate Generation output, consumed next by `ConflictResolver`).
 - **Dependencies:** NumPy for vectorized math. Reads `gesture_confidence_threshold` from Settings.
 - **Error Handling:** `HandData.scale is None` → skip gesture evaluation for that hand entirely this frame (no exception, no fallback to raw pixels — PRD FR-SC-04); NaN/out-of-range landmark values → skip evaluation for that hand, log DEBUG; must never raise — this is the hottest path in the pipeline.
 
@@ -488,20 +500,128 @@ class GestureEngine:
         self.motion_history = MotionHistoryBuffer(max_frames=settings.motion_history_frames)
 
     def evaluate(self, hands: list[HandData], now: float) -> list[GestureResult]:
-        results = []
+        """Generates ALL qualifying candidates (PRD §4.6 Candidate Generation).
+        Does not select a winner -- that is ConflictResolver's job (§3.9.1)."""
+        candidates = []
         for hand in hands:
             if not hand.gesture_eligible or hand.scale is None:
                 continue
             self.motion_history.update(hand.role, hand.landmarks[0], now)
-            candidate = (self._check_static(hand) or self._check_dynamic(hand.role, now))
-            if candidate and candidate.confidence >= self.settings.gesture_confidence_threshold:
-                results.append(candidate)
+            hand_candidates = self._check_all_static(hand) + self._check_all_dynamic(hand.role, now)
+            qualifying = [c for c in hand_candidates
+                          if c.confidence >= self.settings.gesture_confidence_threshold]
+            candidates.extend(qualifying)
+        return candidates
+
+    def _check_all_static(self, hand: HandData) -> list[GestureResult]:
+        """Evaluates every static rule independently and returns every match,
+        rather than short-circuiting on the first match (changed in v1.2 to
+        support Conflict Resolution, PRD §4.6)."""
+        results = []
+        for detect_fn in STATIC_GESTURE_RULES:  # detect_open_palm, detect_pinch, ...
+            result = detect_fn(hand)
+            if result is not None:
+                results.append(result)
         return results
+```
+
+> **Implementation Note — Why This Changed From "First Match Wins":** Prior to PRD v1.3's Conflict Resolution requirement (§4.6), `GestureEngine` used Python's `or` short-circuit operator to return the first matching rule, implicitly encoding a fixed rule-evaluation order as the tie-breaking mechanism. This was never an explicit, documented policy — it was an accident of code structure. PRD §4.6 requires conflict resolution to be deterministic *and documented*; `ConflictResolver` (§3.9.1) now makes that policy explicit and auditable, rather than leaving it implicit in iteration order.
+
+---
+
+### 3.9.1 Recognition Confidence
+
+Gesture recognizers shall assign a confidence value to each candidate gesture.
+
+ConflictResolver shall use these confidence values together with priority rules when selecting the final action.
+
+Confidence calculations must remain deterministic and explainable.
+
+---
+
+### 3.9.1.1 Confidence Scoring
+
+Each recognized gesture shall be assigned a deterministic confidence score representing how well the observed landmarks satisfy the gesture definition.
+
+Confidence scoring is rule-based and explainable.
+
+Confidence may consider:
+
+- Finger joint angles
+- Finger extension states
+- Relative landmark distances
+- Palm orientation
+- Motion consistency
+- Temporal stability
+- Landmark visibility confidence
+
+Confidence scores are not produced by machine learning models.
+
+ConflictResolver shall use confidence scores together with gesture priorities and temporal validation to determine the final action.
+
+---
+
+### 3.9.2 ConflictResolver *(new in v1.2, implements PRD §4.6)*
+
+Selects a single winning `GestureResult` per hand role when `GestureEngine` produces multiple qualifying candidates for the same hand in the same frame.
+
+- **Responsibilities:** group candidates by `hand_role`; if a role has exactly one candidate, pass it through unchanged (PRD FR-CR-01); if a role has multiple candidates, select the one with the strictly highest `confidence` (PRD FR-CR-02); if multiple candidates are tied at the same confidence, apply the fixed priority order — fewer-required-extended-fingers gestures win over more-fingers gestures (PRD FR-CR-03); operate independently per hand role, never letting a conflict on one hand affect the other (PRD FR-CR-04).
+- **Inputs:** `list[GestureResult]` (0–N per hand, from `GestureEngine.evaluate()`).
+- **Outputs:** `list[GestureResult]` (at most one per hand role).
+- **Dependencies:** Pure Python. A static, hardcoded priority table for tie-breaking (PRD FR-CR-03) — not configurable per-profile, to keep conflict outcomes predictable and testable.
+- **Error Handling:** an empty candidate list for a role produces no output for that role (not an error — this is simply "no gesture this frame"); never raises.
+
+```python
+# Fixed tie-break priority: gestures requiring fewer extended fingers are
+# more geometrically specific and preferred over more general poses
+# (PRD FR-CR-03). Lower number = higher priority.
+GESTURE_TIE_BREAK_PRIORITY = {
+    'pinch': 0, 'ok_sign': 0,            # 0-1 fingers involved in the defining check
+    'thumbs_up': 1, 'thumbs_down': 1,     # 1 finger extended
+    'peace_sign': 2,                       # 2 fingers extended
+    'three_fingers': 3,                    # 3 fingers extended
+    'open_palm': 4,                        # 5 fingers extended -- most general, lowest priority
+}
+
+class ConflictResolver:
+    def resolve(self, candidates: list[GestureResult]) -> list[GestureResult]:
+        by_role: dict[str, list[GestureResult]] = {}
+        for c in candidates:
+            by_role.setdefault(c.hand_role, []).append(c)
+
+        winners = []
+        for role, role_candidates in by_role.items():
+            if len(role_candidates) == 1:
+                winners.append(role_candidates[0])  # FR-CR-01
+                continue
+            max_confidence = max(c.confidence for c in role_candidates)
+            tied = [c for c in role_candidates if c.confidence == max_confidence]
+            if len(tied) == 1:
+                winners.append(tied[0])  # FR-CR-02
+            else:
+                # FR-CR-03: tie-break by fixed priority (lower number wins)
+                tied.sort(key=lambda c: GESTURE_TIE_BREAK_PRIORITY.get(c.gesture_name, 99))
+                winners.append(tied[0])
+        return winners  # FR-CR-04: independent per role, by construction (grouped by role above)
+```
+
+**Worked example (matches PRD §4.6's example exactly):**
+
+```python
+candidates = [
+    GestureResult(gesture_name='peace_sign',    confidence=0.81, hand_role='HAND_A', ...),
+    GestureResult(gesture_name='three_fingers',  confidence=0.88, hand_role='HAND_A', ...),
+]
+resolver = ConflictResolver()
+winners = resolver.resolve(candidates)
+# winners == [GestureResult(gesture_name='three_fingers', confidence=0.88, ...)]
+# peace_sign discarded -- lower confidence, not a tie, so FR-CR-02 applies directly.
 ```
 
 ---
 
-### 3.10 StabilityFilter *(new in v1.2, implements PRD §8.2)*
+### 3.10 StabilityFilter *(new in v1.2, implements PRD §8.2; now consumes ConflictResolver's output, not GestureEngine's raw output directly)*
+
 
 Requires a static gesture to remain the highest-confidence match for a continuous hold window before it's accepted, eliminating single-frame flicker triggers.
 
@@ -907,11 +1027,15 @@ Activation Check
    │ INACTIVE --> render only, continue
    │ ACTIVE
    ▼
-Gesture Candidate          (GestureEngine, scale-invariant rules)
-   │ no candidate? --> render, continue
+Gesture Candidate          (GestureEngine, scale-invariant rules; returns ALL
+                             qualifying candidates per hand, v1.2)
+   │ no candidates? --> render, continue
    ▼
 Confidence Check
    │ below threshold? --> discard, render, continue
+   ▼
+Conflict Resolution        (ConflictResolver -- selects single winner per hand
+                             when multiple candidates qualify, v1.2, PRD §4.6)
    ▼
 Stability Check            (StabilityFilter -- static gestures only)
    │ <200ms held? --> discard (no partial credit), render, continue
@@ -943,9 +1067,10 @@ Overlay Render               (incl. quality warning badges)
 | Hand Scale Estimated | Identity assigned | → Primary Hand Filtered | scale=None → that hand skips gesture eval, still renders |
 | Primary Hand Filtered | Scale estimated | → Activation Check | N/A — pass-through if Dominant Hand Mode off |
 | Activation Check | Hand filtered | → Gesture Candidate (if ACTIVE) | INACTIVE → render only (open_palm still feeds hold-timer) |
-| Gesture Candidate | ACTIVE confirmed | → Confidence Check (if rule matches) | No match → → Overlay Render |
-| Confidence Check | Candidate produced | → Stability Check (if ≥ threshold) | Below threshold → discard, → Overlay Render |
-| Stability Check | Confidence passed | → Context Resolution (if held 200ms, or is dynamic) | Held <200ms → discard, no partial credit |
+| Gesture Candidate | ACTIVE confirmed | → Confidence Check (if any rule matches) | No match → → Overlay Render |
+| Confidence Check | Candidate(s) produced | → Conflict Resolution (if ≥1 candidate ≥ threshold) | All candidates below threshold → discard, → Overlay Render |
+| Conflict Resolution | ≥1 qualifying candidate per hand | → Stability Check (single winner per hand selected) | N/A — always resolves to 0 or 1 winner per hand (PRD FR-CR-01–04) |
+| Stability Check | Conflict resolved | → Context Resolution (if held 200ms, or is dynamic) | Held <200ms → discard, no partial credit |
 | Context Resolution | Stability passed | → Action Mapping | OS query fails → cached context, continue |
 | Action Mapping | Context resolved+verified | → Cooldown Check (if mapping exists) | No mapping → log info, → Overlay Render |
 | Cooldown Check | Action resolved | → Action Execution (if cooldown elapsed) | Still cooling down → suppress, → Overlay Render |
@@ -1439,7 +1564,9 @@ class CalibrationManager:
 
 ## 11. Cross-Platform Strategy
 
-*(Unchanged from TRD v1.0 — included here for completeness since this is a single consolidated document.)*
+*(Re-scoped in TRD v1.2 per PRD v1.3 §1.2's platform-scope narrowing. The adapter-pattern architecture below is unchanged from TRD v1.0 — it is preserved in full, not removed, because it is precisely the mechanism that makes macOS/Linux a clean future-expansion path rather than a future rewrite. What changes is implementation scope: only the Windows adapter/executor column is built and validated for the initial release. macOS and Linux columns remain fully specified as architectural targets but are not implementation deliverables until the Future Expansion phase, PRD §1.2.)*
+
+> **Implementation Scope Note (v1.2):** `WindowsContextAdapter` and `WindowsExecutor` are the only adapter/executor implementations in scope for Implementation Plan Checkpoints 5/6/10 of the initial release. `MacOSContextAdapter`/`MacOSExecutor` and `LinuxContextAdapter`/`LinuxExecutor` remain as documented interface targets below so that a future-expansion implementation has an unambiguous spec to build against — they are not stubbed, mocked, or partially implemented in the initial release; they simply do not exist yet as code.
 
 ### 11.1 Adapter Pattern
 
@@ -1453,6 +1580,8 @@ class CalibrationManager:
     ┌───────▼──┐   ┌──────▼─────┐   ┌───▼────────┐
     │ Windows   │   │ macOS       │   │ Linux       │
     │ (pywin32) │   │ (pyobjc)    │   │ (Xlib)      │
+    │ PRIMARY   │   │ FUTURE      │   │ FUTURE      │
+    │ RELEASE   │   │ EXPANSION   │   │ EXPANSION   │
     └───────────┘   └─────────────┘   └─────────────┘
 
     Selected once at startup via platform.system()
@@ -1460,41 +1589,45 @@ class CalibrationManager:
 
 ### 11.2 ContextAdapter Implementations
 
-| Platform | Library / API | Notes |
-|---|---|---|
-| Windows | pywin32 (`win32gui`, `win32process`) | `GetForegroundWindow()` → PID → `GetModuleFileNameEx()`, cached per PID |
-| macOS | pyobjc (`AppKit.NSWorkspace`) | `frontmostApplication()` returns active app directly |
-| Linux | Xlib (`python-xlib`) | Queries `_NET_ACTIVE_WINDOW`; degrades to `'global'` on pure-Wayland sessions, logged once at INFO |
+| Platform | Library / API | Notes | Release Status |
+|---|---|---|---|
+| Windows | pywin32 (`win32gui`, `win32process`) | `GetForegroundWindow()` → PID → `GetModuleFileNameEx()`, cached per PID | **Primary release target** |
+| macOS | pyobjc (`AppKit.NSWorkspace`) | `frontmostApplication()` returns active app directly | Future expansion — spec only |
+| Linux | Xlib (`python-xlib`) | Queries `_NET_ACTIVE_WINDOW`; degrades to `'global'` on pure-Wayland sessions, logged once at INFO | Future expansion — spec only |
 
 ### 11.3 CommandExecutor Implementations
 
 | Action Category | Library Used | Platform Notes |
 |---|---|---|
-| Cursor movement | `pynput.mouse.Controller` (via CursorController) | Lowest latency path, identical across OSes |
+| Cursor movement | `pynput.mouse.Controller` (via CursorController) | Lowest latency path; identical interface across OSes, Windows is the validated implementation |
 | Clicks (pinch/OK) | `pynput.mouse.Controller` | Consistent low-latency dispatch |
 | Keyboard shortcuts | `pynput.keyboard.Controller` | Context-managed press/release pairs avoid stuck-key bugs |
-| Volume/Brightness | `pycaw` (Win), `osascript` (macOS), `amixer`/`brightnessctl` (Linux) | Each OS executor implements independently behind shared interface |
-| Screenshot | `pyautogui.screenshot()` | Cross-platform |
-| Lock screen | `LockWorkStation` (Win), `osascript` (macOS), `loginctl` (Linux) | Non-fatal if denied, logged WARN |
-| App launch | `subprocess.Popen()` | Path resolution differs per OS |
+| Volume/Brightness | `pycaw` (Win — primary release); `osascript` (macOS — future expansion); `amixer`/`brightnessctl` (Linux — future expansion) | Each OS executor implements independently behind shared interface |
+| Screenshot | `pyautogui.screenshot()` | Cross-platform API; validated on Windows for this release |
+| Lock screen | `LockWorkStation` (Win — primary release); `osascript` (macOS — future expansion); `loginctl` (Linux — future expansion) | Non-fatal if denied, logged WARN |
+| App launch | `subprocess.Popen()` | Path resolution differs per OS; Windows path resolution is the validated implementation |
 
 ### 11.4 Permissions by Platform
 
-| Platform | Required Permission | Failure Mode |
-|---|---|---|
-| Windows | Webcam access only | `CameraUnavailableError` → onboarding wizard |
-| macOS | Camera + Accessibility (for synthetic input) | Camera denial → wizard; Accessibility denial → per-action dispatch failures, logged, one-time notification |
-| Linux | Camera (`/dev/video*`), X11 access | Rare on logged-in desktop sessions; caught and logged if it occurs |
+| Platform | Required Permission | Failure Mode | Release Status |
+|---|---|---|---|
+| Windows | Webcam access only | `CameraUnavailableError` → onboarding wizard | **Primary release target** |
+| macOS | Camera + Accessibility (for synthetic input) | Camera denial → wizard; Accessibility denial → per-action dispatch failures, logged, one-time notification | Future expansion — spec only |
+| Linux | Camera (`/dev/video*`), X11 access | Rare on logged-in desktop sessions; caught and logged if it occurs | Future expansion — spec only |
+
+### 11.5 Future Expansion Activation Criteria
+
+When macOS or Linux support is activated for implementation (a product decision per PRD §1.2, requiring its own Implementation Plan checkpoint additions), the corresponding adapter/executor classes in this section are implemented against the already-frozen `ContextAdapter`/`CommandExecutor` ABC interfaces (§11.1) — no change to `ContextEngine` or `ActionEngine` is required, since those components were always written platform-agnostically against the ABC, not against the Windows implementation specifically. This is the architectural payoff of keeping the adapter pattern fully specified now rather than narrowing the interfaces to Windows-only.
 
 ---
 
 ## 12. Packaging Strategy
 
-*(Unchanged from TRD v1.0; MediaPipe bundling note remains critical for v1.2 since no new native dependencies were added.)*
+*(Re-scoped in TRD v1.2 per PRD v1.3 §1.2/§20: the initial release builds and validates the Windows artifact only. The `hiddenimports` list below retains the macOS/Linux `pynput` backend entries deliberately — they are harmless to include now and remove the need to revisit this spec when Future Expansion packaging work begins. macOS/Linux packaging rows in §12.3 remain documented as the target shape for that future work, not as current build deliverables.)*
 
 ### 12.1 Build Mode
 
-One-folder (`--onedir`) is the recommended default for the installed application (faster startup than `--onefile`), wrapped in a per-platform installer so end users still experience a single download.
+One-folder (`--onedir`) is the recommended default for the installed application (faster startup than `--onefile`), wrapped in a Windows installer for the initial release so end users still experience a single download. The same approach applies to macOS/Linux when Future Expansion packaging work begins (§12.3).
 
 ### 12.2 PyInstaller Spec (key excerpt)
 
@@ -1509,6 +1642,8 @@ a = Analysis(
     ],
     hiddenimports=[
         'pynput.keyboard._win32', 'pynput.mouse._win32',
+        # macOS/Linux backend imports retained for Future Expansion readiness
+        # (PRD §1.2); inert on the Windows-only initial release build.
         'pynput.keyboard._darwin', 'pynput.mouse._darwin',
         'pynput.keyboard._xorg', 'pynput.mouse._xorg',
     ],
@@ -1516,19 +1651,19 @@ a = Analysis(
 )
 ```
 
-> **Implementation Note — MediaPipe Bundling:** MediaPipe loads its hand-landmark model from a path relative to its installed package location. PyInstaller's static analysis does not always discover these data files automatically — they must be explicitly bundled via `datas`, or the packaged app will fail on first `TrackingModule` init despite working from source.
+> **Implementation Note — MediaPipe Bundling:** MediaPipe loads its hand-landmark model from a path relative to its installed package location. PyInstaller's static analysis does not always discover these data files automatically — they must be explicitly bundled via `datas`, or the packaged app will fail on first `TrackingModule` init despite working from source. This applies regardless of target platform.
 
 ### 12.3 Per-Platform Output Artifact
 
-| Platform | PyInstaller Output | Final Artifact |
-|---|---|---|
-| Windows | `GestureOS/` folder | Inno Setup → `GestureOS_Setup.exe` (Start Menu entry, optional auto-start) |
-| macOS | `GestureOS.app` | Code-signed, notarized, wrapped in `.dmg` |
-| Linux | `GestureOS/` folder | AppImage (primary), `.deb` (secondary) |
+| Platform | PyInstaller Output | Final Artifact | Release Status |
+|---|---|---|---|
+| Windows | `GestureOS/` folder | Inno Setup → `GestureOS_Setup.exe` (Start Menu entry, optional auto-start) | **Primary release target — built and validated in Checkpoint 10** |
+| macOS | `GestureOS.app` | Code-signed, notarized, wrapped in `.dmg` | Future expansion — documented target, not built in initial release |
+| Linux | `GestureOS/` folder | AppImage (primary), `.deb` (secondary) | Future expansion — documented target, not built in initial release |
 
 ### 12.4 Startup Self-Check
 
-On first launch: verify bundled MediaPipe model file exists; verify ≥1 camera device enumerable; verify `~/.gestureos/` writable; verify default mapping/profile JSON files were copied successfully. Any failure shows a specific diagnostic dialog rather than a generic crash.
+On first launch: verify bundled MediaPipe model file exists; verify ≥1 camera device enumerable; verify `~/.gestureos/` writable; verify default mapping/profile JSON files were copied successfully. Any failure shows a specific diagnostic dialog rather than a generic crash. This check is platform-agnostic and applies identically once Future Expansion platforms are built.
 
 ---
 

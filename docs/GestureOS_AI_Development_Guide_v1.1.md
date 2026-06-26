@@ -1,10 +1,11 @@
 # AI Development Guide — GestureOS
 
 **Document Type:** AI Development Guide (Engineering Constitution)
-**Source Documents:** GestureOS PRD v1.2, GestureOS TRD v1.1, GestureOS Implementation Plan v1.0
-**Version:** 1.0.0
+**Source Documents:** GestureOS PRD v1.3, GestureOS TRD v1.2, GestureOS Implementation Plan v1.1
+**Version:** 1.1.0
 **Audience:** AI coding agents, human developers, code reviewers
 **Date:** June 2026
+**Changes in v1.1:** Windows-primary platform scope (§1.1, §3, §12.8); ConflictResolver added to SRP examples (§5.2), dependency direction (§5.3), module boundary example (§5.4), gestures/ folder Allowed list (§4.1); Multi-Signal Recognition discipline added as mandatory validation rule (§7.2), acceptance criterion (§7.4), step in §7.1, and code-review check (§12.2); worked example docstring updated with FR-MS-03 signals-used declaration (§7.5); Reference Hardware Baseline cited explicitly as PRD §16.1 (§14.3); new §12.8 Platform Scope review checklist section.
 
 > **Purpose of This Document:** The PRD defines *what* to build. The TRD defines *how* it is architected. The Implementation Plan defines *when* and *in what order*. This guide defines the **rules of engagement** for every individual unit of work — every prompt, every pull request, every bug fix — so that after hundreds of AI-assisted coding sessions, the codebase still looks like it was written by one disciplined team, not patched together by hundreds of disconnected decisions. This guide does not introduce new features, alter architecture, or override anything in the three source documents. Where this guide is more specific than the source documents, it is filling in *engineering convention*, not product or architecture decisions — and is clearly marked as such.
 
@@ -38,6 +39,8 @@
 GestureOS is a desktop application that acts as an intelligent gesture-based operating layer between the user and the operating system, enabling touchless computer control via webcam-based hand gesture recognition (PRD §1–2). It translates hand gestures captured by a standard webcam into OS-level actions — cursor movement, clicks, keyboard shortcuts, scrolling, and system commands — through a pipeline that is entirely **rule-based geometric analysis**, not machine learning (PRD §4, TRD §1.1).
 
 As of PRD v1.2, recognition is additionally **scale-invariant**: gesture accuracy does not degrade as the user's distance from the camera changes, because every distance and velocity measurement is normalized against a continuously-estimated hand-scale reference rather than compared to fixed pixel or frame-normalized thresholds (PRD §5–6, TRD §4).
+
+As of PRD v1.3, the **primary release target is Windows 10/11**. macOS and Linux remain part of the long-term product roadmap but are deferred to a Future Expansion phase after the Windows release ships. The adapter-pattern architecture (TRD §11) remains in place for all platforms — only the initial build and validation scope has changed. GestureOS is also **not intended to fully replace mouse and keyboard usage** — it is designed for short to medium-duration interactions (presentations, media control, accessibility scenarios) rather than all-day continuous use (PRD §2.3.1).
 
 ### 1.2 Technology Stack
 
@@ -133,11 +136,11 @@ Before writing any code in a fresh checkout:
 | `PyQt6` | 6.6.x | GUI framework: main window, settings, overlay, calibration wizard, system tray (TRD §1.3, §8 `ui/` and `overlay/`) |
 | `pyautogui` | 0.9.x | Cross-platform OS automation: screenshot, simple dispatch fallback (TRD §11.3) |
 | `pynput` | 1.7.x | Low-latency mouse/keyboard dispatch — the primary path for cursor movement and clicks (TRD §3.14, §11.3) |
-| `pywin32` | 306 (Windows-only) | Windows active-window detection for `WindowsContextAdapter` (TRD §11.2) |
+| `pywin32` | 306 (Windows-only) | Windows active-window detection for `WindowsContextAdapter` (TRD §11.2). **Primary release target is Windows (PRD §1.2) — this is the only ContextAdapter implementation built for the initial release.** |
 | `pytest` | 7.4.x | Test framework — unit, integration, and performance test suites (TRD §13) |
-| `pyinstaller` | 6.x | Packaging into native executables for Windows/macOS/Linux (TRD §12) |
+| `pyinstaller` | 6.x | Packaging into a native Windows executable for the initial release (TRD §12). macOS/Linux packaging is deferred to Future Expansion (PRD §1.2). |
 
-> **Platform-conditional installs:** `pywin32` is Windows-only and must be installed conditionally (`pywin32; sys_platform == 'win32'` in `requirements.txt`). Equivalent platform-specific packages for macOS (`pyobjc`) and Linux (`python-xlib`) follow the same conditional-install pattern (TRD §11.2) and must be added to `requirements.txt` with the matching `sys_platform` marker — never installed unconditionally on a platform where they don't apply.
+> **Platform-conditional installs:** `pywin32` is Windows-only and must be installed conditionally (`pywin32; sys_platform == 'win32'` in `requirements.txt`). Equivalent platform-specific packages for macOS (`pyobjc`) and Linux (`python-xlib`) are architecturally specified in TRD §11.2 for Future Expansion (PRD §1.2) but are **not installed or activated for the initial Windows release** — do not add their `requirements.txt` entries until the Future Expansion packaging checkpoint begins. Adding them prematurely introduces untested import paths into the CI environment.
 
 > **Version-pin discipline:** If a dependency needs to be upgraded (e.g., a MediaPipe security patch), this is a deliberate action: update the pin in `requirements.txt`, re-run the full test suite (Section 9), and re-run the Checkpoint 1 PyInstaller smoke-build (Implementation Plan §5, Risks row 2) specifically because MediaPipe version changes have historically been the most likely source of packaging breakage (TRD §16).
 
@@ -252,9 +255,9 @@ For each folder: Purpose, Allowed Responsibilities, Forbidden Responsibilities, 
 
 #### `gestures/`
 - **Purpose:** All recognition logic — the rule-based engine.
-- **Allowed:** Pure functions implementing gesture rules, plus `GestureEngine`/`ActivationGate`/`StabilityFilter`/`CooldownFilter` classes.
+- **Allowed:** Pure functions implementing gesture rules, plus `GestureEngine`/`ConflictResolver`/`ActivationGate`/`StabilityFilter`/`CooldownFilter` classes.
 - **Forbidden:** No camera access. No OS-automation imports (`pyautogui`, `pynput` must never appear in this folder). No PyQt6 imports.
-- **Example Files:** `static_recognizer.py`, `dynamic_recognizer.py`, `motion_history.py`, `gesture_engine.py`, `stability_filter.py`, `cooldown_filter.py`, `activation_gate.py`, `gesture_utils.py`
+- **Example Files:** `static_recognizer.py`, `dynamic_recognizer.py`, `motion_history.py`, `gesture_engine.py`, `conflict_resolver.py`, `stability_filter.py`, `cooldown_filter.py`, `activation_gate.py`, `gesture_utils.py`
 
 #### `context/`
 - **Purpose:** Active-window detection, OS-specific via the adapter pattern.
@@ -336,16 +339,19 @@ Every component has exactly one job, matching its TRD §3 specification's Respon
 Each class matches one TRD §3 component entry. Do not add a second responsibility to an existing class because it's "related" or "convenient." For example:
 
 - `CameraValidator` measures FPS/resolution quality. It does not also manage camera reconnection — that's `CameraModule`'s job (TRD §3.1 vs §3.2 are deliberately separate classes despite both being "camera-adjacent").
-- `StabilityFilter` and `CooldownFilter` are separate classes (TRD §3.10, §3.11) even though both are timer-based gates sitting in sequence in the pipeline, because they answer different questions ("has this gesture been held long enough?" vs. "has enough time passed since this gesture last fired?") and are independently configurable, independently testable, and independently disabled-for-dynamic-gestures (stability) vs. always-active (cooldown).
+- **`CameraModule`** validates camera hardware and **`CameraValidator`** monitors running performance (TRD §3.1 vs §3.2) are deliberately separate classes despite both being "camera-adjacent", because they answer different questions at different moments in the pipeline lifecycle.
+- **`StabilityFilter`** and **`CooldownFilter`** are separate classes (TRD §3.10, §3.11) even though both are timer-based gates sitting in sequence in the pipeline, because they answer different questions ("has this gesture been held long enough?" vs. "has enough time passed since this gesture last fired?") and are independently configurable, independently testable, and independently disabled-for-dynamic-gestures (stability) vs. always-active (cooldown).
+- **`GestureEngine`** and **`ConflictResolver`** are separate classes (TRD §3.9, §3.9.1) even though they are sequentially adjacent, because they do distinct things: `GestureEngine` generates *all* qualifying candidates per hand per frame; `ConflictResolver` selects *one winner* per hand when multiple candidates exist (PRD §4.6). Combining them would make it impossible to unit-test candidate generation and conflict resolution independently, and would re-introduce the original "first-match-wins" implicit ordering that PRD §4.6 explicitly replaced with documented, auditable confidence-based selection.
 
 ### 5.3 Dependency Direction
 
-Data flows in one direction through the pipeline (TRD §2.1, §5.1): Camera → Tracking → Analysis → Recognition → Activation → Context → Actions → Diagnostics/Overlay. A component may only depend on (import from) components *earlier* in this chain, never later.
+Data flows in one direction through the pipeline (TRD §2.1, §5.1): Camera → Tracking → Analysis → Recognition → **Conflict Resolution** → Activation → Context → Actions → Diagnostics/Overlay. A component may only depend on (import from) components *earlier* in this chain, never later.
 
 ```
 ALLOWED:    gestures/ imports from tracking/ and models/
 FORBIDDEN:  tracking/ imports from gestures/
 FORBIDDEN:  camera/ imports from anything except models/ and stdlib/third-party
+FORBIDDEN:  gestures/conflict_resolver.py imports from actions/ or context/
 ```
 
 The only exceptions, explicitly carved out by TRD §3's Component Boundary Rule:
@@ -354,7 +360,7 @@ The only exceptions, explicitly carved out by TRD §3's Component Boundary Rule:
 
 ### 5.4 Module Boundaries
 
-A component's only "interface" to the rest of the system is the data object(s) it produces, as documented in its TRD §3 entry's Outputs field. A component must never reach into another component's internal state — e.g., `ActionEngine` must never inspect `GestureEngine`'s internal trajectory buffer directly; it only ever receives a finished `GestureResult` object that has already passed through `StabilityFilter` and `CooldownFilter`.
+A component's only "interface" to the rest of the system is the data object(s) it produces, as documented in its TRD §3 entry's Outputs field. A component must never reach into another component's internal state — e.g., `ActionEngine` must never inspect `GestureEngine`'s internal trajectory buffer directly; it only ever receives a finished, conflict-resolved `GestureResult` object that has already passed through `ConflictResolver`, `StabilityFilter`, and `CooldownFilter`.
 
 **Rule:** If implementing a feature requires reaching past a component's public method/dataclass interface into its private internals, the feature is mis-scoped — either the public interface needs a deliberate, reviewed extension (update the TRD), or the feature belongs in a different component.
 
@@ -564,7 +570,7 @@ For any gesture (new or modified), in this exact order:
    Prefer the lowest-numbered (simplest, most scale-robust) priority tier that is sufficient to distinguish the gesture from every other gesture in the set.
 3. **Implement using only the shared primitives in `gestures/gesture_utils.py`** (`euclidean_distance()`, `finger_angle()`, `finger_states()`) and, for dynamic gestures, `MotionHistoryBuffer`. Do not write a new, parallel distance or angle calculation inline — if `gesture_utils.py` doesn't yet have the primitive you need, add it there, not inline in the gesture function.
 4. **Write the function in the correct file:** static gestures in `gestures/static_recognizer.py`, dynamic gestures in `gestures/dynamic_recognizer.py`. Function name is `detect_<gesture_name>` matching the gesture's `snake_case` identifier exactly (Section 6.1).
-5. **Register the gesture with `GestureEngine`** so it's included in the per-frame evaluation pass (TRD §3.9).
+5. **Register the gesture with `GestureEngine`** by adding it to the `STATIC_GESTURE_RULES` (or dynamic equivalent) list in `gestures/gesture_engine.py` so it is included in the all-candidates generation pass (TRD §3.9). The `ConflictResolver` downstream handles cases where multiple registered rules match simultaneously — do not add artificial early-exit logic inside `GestureEngine` to prevent multiple matches, as that would reintroduce the old "first-match-wins" implicit ordering that PRD §4.6 explicitly replaced.
 6. **Add fixture data** under `tests/fixtures/` — a recorded or synthetically-constructed landmark set (static) or trajectory (dynamic) representing a clear, unambiguous instance of the gesture.
 7. **Write unit tests** per Section 7.3 below before considering the gesture done.
 8. **Add the gesture to the default mapping files** (`assets/default_mappings/*.json`) only if the PRD's profile descriptions (PRD §8.9) call for it in that profile — do not add a gesture to every profile by default just because it now exists.
@@ -574,6 +580,7 @@ For any gesture (new or modified), in this exact order:
 Every gesture implementation must satisfy all of the following before it can be considered complete — these are not best-effort guidelines, they are gate conditions:
 
 - **No raw-pixel or raw-frame-normalized threshold.** Every distance comparison divides by `hand.scale.palm_width` or `hand.scale.palm_height` first (PRD §5.2's explicit worked example of the forbidden pattern). Every dynamic-gesture displacement/velocity comparison divides by `hand_scale` first (TRD §4.4). This is checked by code review (Section 12) and by the mandatory scale-invariance test (7.3).
+- **Multi-signal discipline is mandatory (PRD §4.5, FR-MS-01–03).** Every static gesture rule combines at least two independent geometric signals before producing a candidate `GestureResult` — a finger-state pattern alone, or a single normalized-distance check alone, is not sufficient. Every dynamic gesture rule combines at least velocity, direction, and motion-history shape — single-frame displacement alone is never sufficient. The gesture function's docstring must explicitly list the signals it combines (FR-MS-03), e.g.: `"""Signals used: finger-state (EXTENDED/CURLED), normalized thumb-index distance, remaining-finger state."""`
 - **`hand.scale is None` is handled by returning `None` immediately**, not by falling back to an unnormalized calculation (PRD FR-SC-04). There is no acceptable fallback path that bypasses normalization.
 - **The function never raises.** Per Section 6.4's hot-path rule — malformed input degrades to `None`, it never propagates an exception.
 - **Confidence is a meaningful, graded value, not always a fixed constant**, where the geometry naturally supports it (e.g., Pinch's confidence scales with how far below the 0.35 threshold the normalized distance falls, TRD §4.3's `detect_pinch` reference implementation: `confidence = 1.0 - (normalized_dist / 0.35)`). Where the rule is a pure boolean match with no natural gradient (e.g., Three Fingers' finger-state pattern match), a fixed high-confidence constant (e.g., `0.9`) is acceptable and matches the pattern already used for similar boolean-rule gestures.
@@ -606,6 +613,9 @@ A gesture implementation is acceptable for merge when:
 - All Section 7.3 tests exist and pass
 - The gesture's behavior matches its PRD §4.3/§4.4 rule summary exactly — no embellishment, no "improvement" on the documented rule without a flagged PRD-change request
 - Code review (Section 12) confirms no raw-pixel threshold exists anywhere in the new code
+- **The gesture function's docstring explicitly lists the signals it combines (PRD FR-MS-03)** — "signals used: X, Y" must appear in every `detect_*` function's docstring; a function without this is incomplete regardless of whether its logic is correct
+- **The gesture combines at least two independent signals (PRD FR-MS-01 for static, FR-MS-02 for dynamic)** — confirmed by reading the docstring and the implementation against the multi-signal table in PRD §4.5
+- **`ConflictResolver` compatibility verified**: the gesture function returns `None` cleanly when it does not match (not `0.0` confidence, not a special sentinel — literally `None`), so that `GestureEngine`'s all-candidates list remains uncontaminated by zero-confidence entries that `ConflictResolver` would then have to filter out downstream
 - The gesture's accuracy, when later validated in Checkpoint 9's multi-distance UAT (Implementation Plan §13), is expected to meet the PRD §21.1 KPI of ≥95% accuracy stable within 3% across near/medium/far camera distances — a gesture implementation that structurally cannot meet this (e.g., uses an un-normalized threshold) must not be merged regardless of how it performs in ad-hoc manual testing at a single distance
 
 ### 7.5 Worked Example — Adding/Modifying a Static Gesture
@@ -622,6 +632,10 @@ def detect_ok_sign(hand: HandData) -> GestureResult | None:
     unconstrained).
 
     Implements PRD §4.3 (OK Sign gesture rule). Default action: Right Click.
+
+    Signals used: normalized thumb-index distance (Priority 3, palm_width
+    denominator) + remaining-finger EXTENDED state (Priority 1). Two
+    independent signals required per PRD FR-MS-01.
     """
     if hand.scale is None:
         return None  # PRD FR-SC-04
@@ -962,6 +976,22 @@ This section governs how AI coding agents — including future instances of the 
 5. **Avoid rewriting unrelated modules.** A prompt asking to "fix the swipe-left cooldown" touches `gestures/cooldown_filter.py` and possibly `gestures/dynamic_recognizer.py` — it does not touch `overlay/debug_panel.py`'s formatting, even if the AI notices something it would "improve" there while looking around. Unrelated improvements are a separate, explicitly-requested task.
 6. **Explain assumptions.** When a prompt is ambiguous about which gesture, which threshold, which checkpoint's scope applies, the AI states its interpretation explicitly before or alongside the change, so a human reviewer can catch a wrong assumption immediately rather than discovering it three prompts later.
 7. **Cite source documents.** Any new function's docstring references the PRD requirement ID or TRD section it implements (Section 6.6) — this is what keeps hundreds of future prompts traceable back to a single source of truth instead of devolving into tribal knowledge.
+8. When implementing a new gesture:
+For every newly implemented gesture, the AI must document:
+- Gesture name and purpose
+- Recognition logic
+- Geometric features used
+  - Finger joint angles
+  - Finger states
+  - Relative landmark distances
+  - Palm orientation
+  - Motion history (if applicable)
+- Confidence calculation
+- Conflict-resolution behavior
+- Temporal validation requirements (hold time, debounce, cooldown, etc.)
+- Performance impact
+- Configuration constants added or modified
+- Test cases and expected behavior
 
 ### 11.2 What the AI Must Never Do
 
@@ -969,6 +999,10 @@ This section governs how AI coding agents — including future instances of the 
 - Change an existing architecture decision (e.g., switching `CursorController`'s default smoothing method, restructuring the threading model, replacing JSON config with a database) without an explicit, separate architecture-change request and corresponding TRD update.
 - Add a new third-party dependency not already in TRD §1.3's stack (Section 2.4) to solve a problem the existing stack already addresses.
 - Introduce a raw-pixel or raw-frame-normalized threshold anywhere in `gestures/` (Section 7.2 — this is the single most-repeated rule in this guide because it is the single most likely silent regression).
+- Implement a gesture rule using only a single geometric signal — every `detect_*` function must combine at least two independent signals (PRD FR-MS-01/FR-MS-02) and declare them in its docstring (FR-MS-03). A function that checks only one signal is incomplete regardless of how accurate it appears in casual testing.
+- Merge `GestureEngine`'s candidate-generation responsibility with `ConflictResolver`'s winner-selection responsibility back into a single class or a single function using short-circuit `or` logic — this reverts a deliberate, documented architecture decision (TRD §3.9/§3.9.1, PRD §4.6) and silently reintroduces implicit first-match-wins ordering.
+- Create `MacOSExecutor`, `LinuxExecutor`, `MacOSContextAdapter`, or `LinuxContextAdapter` implementation files — these are Future Expansion deliverables (PRD §1.2, TRD §11.5) not in scope for the initial Windows release. The ABCs exist and are documented; the concrete implementations do not yet exist and must not be created until Future Expansion work is explicitly authorized.
+- Add `pyobjc`, `python-xlib`, or any macOS/Linux-specific library to `requirements.txt` for the initial release build.
 - Suppress an exception with a bare `except: pass` (Section 6.4).
 - Mutate a `Settings` object in place from a non-owning thread (Section 5.6).
 - Mark a task "done" without the corresponding tests passing (Section 9) and the corresponding Definition of Done (Section 15) satisfied.
@@ -1030,6 +1064,8 @@ Every change — whether authored by a human or an AI agent — passes this chec
 - [ ] Every new or modified distance comparison in `gestures/` divides by `hand.scale.palm_width`/`palm_height` before comparison — **no raw-pixel or raw-frame-normalized threshold exists anywhere** (Section 7.2; this is the single highest-priority check item, given its history as a recurring regression pattern, Section 10.6)
 - [ ] Every new or modified dynamic-gesture displacement/velocity calculation is normalized by `hand_scale` (TRD §4.4)
 - [ ] `hand.scale is None` is handled by returning `None`, not by falling back to an unnormalized path (PRD FR-SC-04)
+- [ ] Every new or modified `detect_*` function combines **at least two independent geometric signals** (PRD FR-MS-01/FR-MS-02) and its docstring explicitly names them (FR-MS-03)
+- [ ] New gesture functions return `None` (not `0.0` confidence, not a sentinel object) when the gesture does not match — required for clean `ConflictResolver` candidate-list compatibility (TRD §3.9.1)
 
 ### 12.3 Coding Standards
 
@@ -1049,6 +1085,7 @@ Every change — whether authored by a human or an AI agent — passes this chec
 ### 12.5 Testing
 
 - [ ] New functions have unit tests; new gestures have the full Section 7.3 test set including scale-invariance parametrization where applicable
+- [ ] New gestures have a `test_conflict_resolver.py`-compatible test confirming they return `None` cleanly when they do not match (not a zero-confidence result)
 - [ ] New cross-cutting behavior has an integration test, where the pipeline is sufficiently wired for one to be meaningful (Section 9.2)
 - [ ] Bug fixes include a regression test that fails pre-fix and passes post-fix (Section 9.4/10.3)
 - [ ] Coverage for touched modules remains ≥80% (Section 9.5)
@@ -1064,6 +1101,12 @@ Every change — whether authored by a human or an AI agent — passes this chec
 
 - [ ] If the change affects repository structure, naming conventions, or any rule in this guide, this guide itself is updated in the same change (Section 16.2)
 - [ ] If the change reveals a gap in the PRD/TRD/Implementation Plan, it is added to the Gap Register pattern (Implementation Plan, Appendix A), not silently resolved
+
+### 12.8 Platform Scope (Windows-Primary)
+
+- [ ] No new code imports `pyobjc`, `AppKit`, `python-xlib`, or any macOS/Linux-specific library — these are Future Expansion scope (PRD §1.2) and must not appear in the initial-release codebase
+- [ ] No new executor or adapter subclass for macOS or Linux was created — `MacOSExecutor`, `LinuxExecutor`, `MacOSContextAdapter`, `LinuxContextAdapter` are Future Expansion deliverables (TRD §11.5), not current-release deliverables
+- [ ] Any Windows-specific API call is contained within `actions/executors/windows_executor.py` or `context/adapters/windows_adapter.py` — never inlined into `action_engine.py`, `context_engine.py`, or any platform-agnostic module
 
 ---
 
@@ -1116,7 +1159,7 @@ All targets below are reproduced exactly from PRD §16 (Performance Budgets) —
 
 ### 14.3 Where the Budget Comes From
 
-These five numbers are not arbitrary — they trace to the PRD's product requirements: ≥25 FPS and <100ms detection latency are the foundational interactivity requirements (PRD §7.1 Hand Tracking System); <150ms end-to-end latency is what makes gesture-to-action feel responsive rather than laggy; the <300MB/< 20% CPU budgets exist so GestureOS remains a lightweight background presence on the reference hardware (Intel Core i5, 8GB RAM, 720p webcam) rather than competing for resources with the user's actual work. Any change that would require relaxing one of these numbers is a product-level tradeoff discussion, not an implementation detail to quietly accept.
+These five numbers trace to PRD §16.2 and are measured against the **Reference Hardware Baseline defined in PRD §16.1: Intel Core i5 8th Gen or equivalent, 8 GB RAM, 720p webcam**. This is the single authoritative hardware definition for these targets — results measured on other hardware are informational, not pass/fail. The ≥25 FPS and <100ms detection latency targets are the foundational interactivity requirements (PRD §7.1); <150ms end-to-end makes gesture-to-action feel responsive; <300MB/<20% CPU ensures GestureOS remains a lightweight background presence on the reference hardware rather than competing for resources with the user's actual work. Any change that would require relaxing one of these numbers is a product-level tradeoff discussion, not an implementation detail to quietly accept.
 ## 15. Definition of Done
 
 This section restates and operationalizes the Implementation Plan's three-tier Definition of Done (Implementation Plan §16) at the day-to-day development level, adding the explicit "Module Complete" tier this guide's structure calls for.

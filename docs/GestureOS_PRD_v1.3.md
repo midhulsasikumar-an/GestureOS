@@ -1,13 +1,14 @@
 # Product Requirements Document — GestureOS
 
-**Version:** 1.2.0 — Revised Release
+**Version:** 1.3.0 — Revised Release
 **Document Status:** Updated Draft
 **Product Name:** GestureOS
 **Classification:** Desktop Application / Computer Vision / Rule-Based AI
 **Revision Date:** June 2026
 **Changes in v1.2:** Scale-invariant recognition, hand scale estimation, gesture stability window, cooldown system (formalized), cursor smoothing (formalized), motion history buffer, temporary occlusion handling, primary hand selection, camera validation, lighting quality detection, context verification layer, calibration requirement, performance budgets, expanded diagnostics, error recovery requirements, engineering risk matrix, deployment requirements.
+**Changes in v1.3:** Platform scope narrowed to Windows-primary release (macOS/Linux moved to future expansion); Multi-Signal Recognition formalized (§4.5); Conflict Resolution stage formalized with worked example (§4.6); high-level architecture summary added using Feature Extraction / Conflict Resolution / Command Dispatcher / Windows Action Layer terminology (§9.0.1); Reference Hardware Baseline stated explicitly (§16.1); Intended Use and Gorilla Arm limitation statement added (§2.3.1).
 
-> This document supersedes PRD v1.1. All v1.1 requirements remain in force except where explicitly revised below. No requirement from v1.1 has been removed — v1.2 is additive and clarifying.
+> This document supersedes PRD v1.2. All v1.1 and v1.2 requirements remain in force except where explicitly revised below (principally the platform-scope narrowing in §1.2). No requirement has been removed — v1.3 is additive, clarifying, and scope-narrowing only with respect to platform target.
 
 ---
 
@@ -60,8 +61,17 @@ GestureOS is a real-time gesture recognition system that enables users to contro
 
 ### 1.2 Target Platforms
 
-| Windows 10/11 | macOS 12+ | Ubuntu 20.04+ | Python 3.9+ |
-|---|---|---|---|
+> **Platform Scope Update (v1.3):** GestureOS's primary release target is Windows. macOS and Linux support remain part of the long-term product vision but are deferred to future expansion phases, not the initial release. This change narrows near-term engineering scope to allow the Windows release to reach production quality faster; it does not remove macOS/Linux from the roadmap.
+
+**Primary Release Target:**
+
+| Windows 10/11 | Python 3.9+ |
+|---|---|
+
+**Future Expansion (post-initial-release):**
+
+| macOS 12+ | Ubuntu 20.04+ |
+|---|---|
 
 ---
 
@@ -84,6 +94,10 @@ Traditional input devices impose physical and ergonomic constraints on users. Th
 ### 2.3 Solution Overview
 
 GestureOS leverages MediaPipe Hands for landmark detection and applies deterministic geometric rules to classify gestures. No ML model training is required — recognition logic is fully transparent, explainable, and tuneable through configuration parameters. Critically, recognition is **scale-invariant**: it does not depend on raw pixel measurements that change as the user moves closer to or farther from the camera.
+
+### 2.3.1 Intended Use and Known Limitation (Gorilla Arm)
+
+> **New in v1.3:** GestureOS is intended for short and medium-duration interaction and is not intended to fully replace mouse and keyboard usage. Extended, continuous arm-raised gesture use is physically tiring (the well-documented "Gorilla Arm" effect — already tracked as a product risk, §18) and is not the product's primary design target. GestureOS is positioned as a complementary, situational input method — for presentation control, hands-free media control, accessibility scenarios, and similar short-to-medium-duration interactions — rather than an all-day keyboard/mouse replacement. This framing should govern UX copy, onboarding messaging, and any future feature prioritization: features that assume or encourage continuous all-day gesture use are out of scope unless this product positioning is explicitly revisited.
 
 ### 2.4 Value Proposition
 
@@ -208,6 +222,67 @@ Dynamic gestures track the wrist landmark (ID 0) position over a rolling time wi
 | Circular Motion | Trajectory bounding box roughly square; angular progression ≥270° | Open App Launcher |
 
 All dynamic gesture rules are evaluated against **normalized-by-hand-scale** displacement, not raw normalized-frame coordinates alone — see Section 5.4.
+
+### 4.5 Multi-Signal Recognition
+
+> **Requirement (new in v1.3):** No gesture is recognized from a single isolated measurement. Every gesture combines multiple independent geometric signals, so that a momentary noise spike in any one signal does not by itself produce a false positive. This formalizes a practice already implicit in the per-gesture rule summaries above (§4.3/§4.4) as an explicit, auditable requirement.
+
+The table below documents the signal combination required for representative gestures from each category. Every other gesture in §4.3/§4.4 follows the same multi-signal discipline using its own applicable rule summary.
+
+| Gesture | Required Signals (combined, not any single one alone) |
+|---|---|
+| **Pinch** | Thumb–index distance (normalized by palm width) **+** finger angle state of the remaining fingers (used to disambiguate from OK Sign, §4.3) **+** Gesture Stability hold duration (§8.2, prevents a momentary close-approach from false-triggering) |
+| **Swipe (any direction)** | Wrist velocity (normalized) **+** direction consistency over the motion-history window **+** motion-history trajectory shape (predominant-axis check, §4.4) |
+| **Open Palm** | Finger EXTENDED/CURLED state for all five fingers **+** finger angle confirmation (§5.3) **+** fingertip spread normalized by palm width (§4.3) |
+
+- **FR-MS-01:** Every static gesture rule combines at least two independent geometric signals (e.g., a finger-state pattern plus a normalized-distance or angle check) before producing a candidate `GestureResult`.
+- **FR-MS-02:** Every dynamic gesture rule combines at least velocity, direction, and motion-history shape — a single-frame displacement is never sufficient on its own (this is consistent with, and reinforced by, the Motion History Buffer requirement, §8.5).
+- **FR-MS-03:** Multi-signal combination logic for each gesture is documented inline in code (enforced via `RULES.md` §9's Documentation Update Rules) so the specific signals contributing to any gesture's recognition remain traceable.
+
+### 4.6 Conflict Resolution
+
+> **Requirement (new in v1.3):** When more than one gesture rule could plausibly match the same hand in the same frame (e.g., a transitional hand pose that partially satisfies both Peace Sign and Three Fingers, §4.3), the system must resolve this deterministically rather than allowing an arbitrary or order-dependent outcome.
+
+**Recognition flow, with Conflict Resolution as an explicit stage:**
+
+```
+Gesture Detection
+   ↓
+Candidate Generation       (every rule that independently matches produces a candidate)
+   ↓
+Confidence Scoring         (each candidate receives a confidence score, §4.3/§4.4 per-gesture scoring)
+   ↓
+Conflict Resolver          (selects the single highest-confidence candidate; ties broken
+                             deterministically — see below)
+   ↓
+Command Execution
+```
+
+**Conflict Resolution rules:**
+
+- **FR-CR-01:** If exactly one gesture rule produces a candidate for a hand in a given frame, that candidate proceeds with no further resolution needed.
+- **FR-CR-02:** If multiple gesture rules produce candidates for the same hand in the same frame, the candidate with the strictly highest confidence score is selected; all other candidates for that hand are discarded for that frame.
+- **FR-CR-03:** If two or more candidates are tied at the same confidence score (an edge case, expected to be rare given continuous-valued confidence scoring), the tie is broken by a fixed, documented priority order: static gestures with a smaller number of required Extended fingers are preferred over those with more (e.g., Pinch over Open Palm), since fewer-finger gestures are geometrically more specific and less likely to be a transitional false-positive. This priority order is documented in the TRD and is not configurable per-profile, to keep conflict outcomes predictable.
+- **FR-CR-04:** Conflict Resolution operates independently per hand role (`HAND_A`/`HAND_B`, §8.1.1) — a conflict on one hand never affects gesture selection on the other hand.
+
+**Worked example:**
+
+```
+Frame N: Hand HAND_A's landmarks partially satisfy two rules simultaneously
+  during a transition from Peace Sign to Three Fingers:
+
+  Candidate 1: gesture_name='peace_sign',    confidence=0.81
+  Candidate 2: gesture_name='three_fingers',  confidence=0.88
+
+  Conflict Resolver selects Candidate 2 (three_fingers, higher confidence).
+  Candidate 1 is discarded for this frame; no action is taken on it.
+
+  This selection still passes through the Gesture Stability Window (§8.2)
+  before being accepted -- so a single transitional frame favoring
+  three_fingers does not itself guarantee a trigger unless the same
+  resolved gesture continues to win Conflict Resolution for the full
+  200ms stability window.
+```
 
 ---
 
@@ -674,6 +749,34 @@ Diagnostics Logger  (structured event log)
 Overlay Renderer  (landmarks, gesture badge, status bar, quality warnings)
 ```
 
+### 9.0.1 High-Level Architecture Summary (New in v1.3)
+
+> The detailed 17-stage pipeline above is the authoritative, implementation-accurate sequence and remains unchanged. The summary below restates the same pipeline at a higher level of abstraction, using consolidated stage names, for architecture discussions and onboarding where the full 17-stage detail is unnecessary. Each high-level stage maps to one or more of the detailed stages above — no new behavior is introduced by this summary, it is purely a naming/grouping convenience.
+
+```
+Camera
+   ↓
+OpenCV                  (Frame Processor)
+   ↓
+MediaPipe                (MediaPipe Detector)
+   ↓
+Landmark Normalization    (Hand Identity Tracker + Hand Scale Estimator — Section 5/6)
+   ↓
+Feature Extraction         (finger states, finger/joint angles, normalized distances,
+                             motion history — Section 4.2/4.5, Section 8.5)
+   ↓
+Gesture Recognition Engine  (Gesture Recognizer — Section 4)
+   ↓
+Confidence Scoring          (per-gesture confidence, Section 4.3/4.4)
+   ↓
+Conflict Resolution         (Conflict Resolver — Section 4.6)
+   ↓
+Command Dispatcher           (Action Mapper + Cooldown Filter — Section 8.3, 8.7)
+   ↓
+Windows Action Layer          (Command Executor — primary release target, Section 1.2;
+                                 platform-abstracted in the TRD for future expansion)
+```
+
 ### 9.1 Component Responsibilities
 
 | Component | Responsibility | Technology |
@@ -980,6 +1083,19 @@ gestureos/
 
 > Formalizes resource-usage requirements that v1.1 expressed only as FPS targets.
 
+### 16.1 Reference Hardware Baseline
+
+> **New in v1.3:** the Performance Budget targets below are defined and measured against this specific reference hardware configuration. This is the baseline used throughout this document, the TRD, and the Implementation Plan wherever "reference hardware" is referenced — stated here explicitly as the single source of truth for that term.
+
+| Component | Specification |
+|---|---|
+| CPU | Intel Core i5, 8th Generation, or equivalent |
+| RAM | 8 GB |
+| Camera | 720p webcam |
+| Target | 25+ FPS sustained |
+
+### 16.2 Performance Targets
+
 | Metric | Target (Normal Operation) |
 |---|---|
 | FPS | ≥ 25 |
@@ -1075,12 +1191,12 @@ gestureos/
 
 ### 20.1 Packaging
 
-- PyInstaller used to produce a native executable per target OS, bundling Python runtime and all dependencies (no separate Python install required by end users)
+- PyInstaller used to produce a native Windows executable, bundling the Python runtime and all dependencies (no separate Python install required by end users). Packaging for macOS and Linux is deferred to the Future Expansion phase (§1.2) and is not part of the initial release scope.
 
 ### 20.2 Installer
 
 - Windows: Inno Setup-based installer producing a single-file GestureOS_Setup.exe, creating a Start Menu entry and optional auto-start registry key
-- macOS / Linux installer equivalents are addressed at the implementation level in the companion TRD
+- macOS / Linux installer equivalents remain documented at the architectural level in the companion TRD for future-expansion readiness, but are not built or validated as part of the initial release
 
 ### 20.3 Release Deliverables
 

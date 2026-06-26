@@ -1,0 +1,10 @@
+opencv-python==4.8.1.78
+mediapipe==0.10.14
+numpy==1.26.4
+PyQt6==6.6.1
+pyautogui==0.9.54
+pynput==1.7.7
+pywin32==306; sys_platform == 'win32'
+pyinstaller==6.3.0
+pytest==7.4.4
+pytest-cov==4.1.0
