@@ -1,0 +1,59 @@
+{
+  "_comment": "Synthetic frame sequence for OcclusionHandler + HandIdentityModule tests. Each frame lists 0, 1, or 2 hands with their wrist (x, y) positions and chirality. Wrist is the only field required by HandIdentityModule.assign_roles(). Times are in seconds; the sequence is designed so that:\n  - Frame 0 (t=0.000): two hands, left at x=0.2, right at x=0.8 -> roles HAND_A, HAND_B assigned\n  - Frame 1 (t=0.033): two hands still present -> role continuity preserved\n  - Frame 2 (t=0.066): right hand disappears -> right-hand should be BRIDGED (within 300ms)\n  - Frame 3 (t=0.166): right hand still missing -> still bridged (166ms < 300ms)\n  - Frame 4 (t=0.366): right hand still missing -> bridge RELEASES (366ms > 300ms)\n  - Frame 5 (t=0.466): right hand reappears at x=0.8 -> HandIdentityModule reassigns via proximity\n  - Frame 6 (t=0.566): hand-crossing test -- left hand now at x=0.75, right hand at x=0.25 (swapped). Roles preserved across crossing.\n  - Frame 7 (t=0.666): hands back to original positions -> roles preserved.\n",
+
+  "frames": [
+    {
+      "t": 0.000,
+      "hands": [
+        {"chirality": "Left",  "wrist": [0.20, 0.50]},
+        {"chirality": "Right", "wrist": [0.80, 0.50]}
+      ]
+    },
+    {
+      "t": 0.033,
+      "hands": [
+        {"chirality": "Left",  "wrist": [0.21, 0.50]},
+        {"chirality": "Right", "wrist": [0.79, 0.50]}
+      ]
+    },
+    {
+      "t": 0.066,
+      "hands": [
+        {"chirality": "Left", "wrist": [0.21, 0.50]}
+      ]
+    },
+    {
+      "t": 0.166,
+      "hands": [
+        {"chirality": "Left", "wrist": [0.22, 0.50]}
+      ]
+    },
+    {
+      "t": 0.366,
+      "hands": [
+        {"chirality": "Left", "wrist": [0.22, 0.50]}
+      ]
+    },
+    {
+      "t": 0.466,
+      "hands": [
+        {"chirality": "Left",  "wrist": [0.22, 0.50]},
+        {"chirality": "Right", "wrist": [0.79, 0.50]}
+      ]
+    },
+    {
+      "t": 0.566,
+      "hands": [
+        {"chirality": "Left",  "wrist": [0.75, 0.50]},
+        {"chirality": "Right", "wrist": [0.25, 0.50]}
+      ]
+    },
+    {
+      "t": 0.666,
+      "hands": [
+        {"chirality": "Left",  "wrist": [0.20, 0.50]},
+        {"chirality": "Right", "wrist": [0.80, 0.50]}
+      ]
+    }
+  ]
+}
