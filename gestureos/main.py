@@ -1,32 +1,63 @@
 """GestureOS application entry point.
 
-STUB — Checkpoint 0 (Project Foundation).
-Full app wiring (App/core.py + App/capture_thread.py) is implemented in
-Checkpoint 1 (GestureOS Core Platform) and later.
+Checkpoint 1 (GestureOS Core Platform).  Wires up `GestureOSApp`,
+which composes CameraModule + TrackingModule + OverlayWindow + the
+CaptureThread that runs the per-frame pipeline.
 
-This stub exists so the project root has a runnable entry point from the
-very first checkpoint, matching the Implementation Plan §4 Acceptance
-Criteria: 'Running `python main.py` from a clean checkout produces no
-import errors and exits cleanly.'
+Run with:
+    python main.py
+
+Exit codes:
+    0 — clean shutdown (user closed the overlay window)
+    non-zero — fatal init failure (e.g. camera unavailable, tracked via Qt
+               message box or a non-fatal log line in this checkpoint;
+               full UI for error surfacing comes in Checkpoint 8).
+
+Qt initialization order (per Qt's contract — QApplication MUST exist
+before any QWidget is constructed):
+    1. Create QApplication(sys.argv)
+    2. Construct GestureOSApp(qapp=...) — does NOT touch any QWidget
+    3. Call GestureOSApp.start() — lazily constructs OverlayWindow
+    4. Call QApplication.exec() — runs the event loop
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 
+from PyQt6.QtWidgets import QApplication
 
-__version__ = "0.0.0+checkpoint0"
-__checkpoint__ = "0"
+from app.core import GestureOSApp
+
+
+__version__ = "0.1.0+checkpoint1"
+__checkpoint__ = "1"
 
 
 def main() -> int:
-    """Stub entry point. Prints version and exits with code 0.
+    """Boot GestureOSApp and run the Qt event loop."""
+    logging.basicConfig(level=logging.INFO)
 
-    Full GUI / capture-thread / pipeline orchestration is added in
-    Checkpoint 1+ per the Implementation Plan.
-    """
-    print(f"GestureOS v{__version__} (Checkpoint {__checkpoint__} stub)")
-    return 0
+    # QApplication must be constructed BEFORE any QWidget. We build it
+    # here and pass it explicitly to GestureOSApp so the app can defer
+    # all QWidget construction to start().
+    qapp = QApplication.instance() or QApplication(sys.argv)
+
+    try:
+        app = GestureOSApp(qapp=qapp)
+    except Exception as exc:  # noqa: BLE001 — top-level guard per RULES §11.2
+        logging.error(
+            'main',
+            extra={'extras': {'event': 'init_failed', 'error': str(exc)}},
+        )
+        return 1
+
+    logging.info(
+        'main',
+        extra={'extras': {'event': 'starting', 'version': __version__, 'checkpoint': __checkpoint__}},
+    )
+    return app.run()
 
 
 if __name__ == "__main__":
