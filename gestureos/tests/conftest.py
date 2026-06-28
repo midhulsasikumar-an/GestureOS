@@ -196,6 +196,115 @@ def make_wrist_only_hand(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint 3 helpers
+# ---------------------------------------------------------------------------
+
+def make_hand_with_scale(
+    pose_name: str | None = None,
+    chirality: str = 'Right',
+    confidence: float = 1.0,
+    role: str | None = None,
+    hand_scale: float | None = None,
+    wrist_offset: tuple[float, float] = (0.0, 0.0),
+    **overrides,
+):
+    """Build a HandData with a `HandScale` populated, for static-gesture tests.
+
+    Args:
+        pose_name: optional fixture pose from sample_landmarks.json.
+            If None, uses a minimal synthetic hand.
+        chirality: 'Left' or 'Right'.
+        confidence: hand-detection confidence.
+        role: 'HAND_A' / 'HAND_B' / None.
+        hand_scale: value to use for `HandScale.palm_width` and
+            `palm_height`. If None, derives from the pose's
+            actual landmark geometry.
+        wrist_offset: (dx, dy) translation of all landmarks.
+        **overrides: forwarded to HandData constructor.
+    """
+    if pose_name is not None:
+        landmarks = load_pose_landmarks(pose_name)
+    else:
+        landmarks = make_landmarks()
+
+    if wrist_offset != (0.0, 0.0):
+        ox, oy = wrist_offset
+        landmarks = [(lm[0] + ox, lm[1] + oy, lm[2]) for lm in landmarks]
+
+    from models.data_models import HandScale
+    from gestures.gesture_utils import (
+        INDEX_MCP, PINKY_MCP, WRIST, euclidean_distance,
+    )
+    actual_palm_width = euclidean_distance(
+        landmarks[INDEX_MCP], landmarks[PINKY_MCP]
+    )
+    actual_palm_height = euclidean_distance(landmarks[WRIST], landmarks[9])
+
+    if hand_scale is None:
+        # Use the actual landmark-derived palm width so any test using
+        # `pinch_landmarks_base` directly produces consistent scale.
+        scale = HandScale(
+            palm_width=actual_palm_width,
+            palm_height=actual_palm_height,
+            bounding_box=(
+                min(lm[0] for lm in landmarks),
+                min(lm[1] for lm in landmarks),
+                max(lm[0] for lm in landmarks),
+                max(lm[1] for lm in landmarks),
+            ),
+            smoothed_scale=(actual_palm_width + actual_palm_height) / 2.0,
+        )
+    else:
+        scale = HandScale(
+            palm_width=hand_scale,
+            palm_height=hand_scale,
+            bounding_box=(0.0, 0.0, 1.0, 1.0),
+            smoothed_scale=hand_scale,
+        )
+
+    return make_hand(
+        landmarks=landmarks,
+        chirality=chirality,
+        confidence=confidence,
+        role=role,
+        scale=scale,
+        **overrides,
+    )
+
+
+def scale_hand_landmarks(
+    hand,  # type: ignore[no-untyped-def]  # HandData
+    factor: float,
+):
+    """Synthetically scale a hand's landmarks around the wrist, then
+    re-derive `HandScale` from the scaled geometry (so the result is
+    still scale-invariant under `palm_width`-normalized rules).
+
+    Used by `test_scale_invariance.py` to verify the canonical
+    Pinch and Swipe Right rules across distances (TRD §4.6 pattern).
+    """
+    from dataclasses import replace
+    from models.data_models import HandScale
+    from gestures.gesture_utils import (
+        INDEX_MCP, PINKY_MCP, WRIST, euclidean_distance,
+    )
+    from tracking.hand_scale import HandScaleEstimator
+
+    wrist = hand.landmarks[WRIST]
+    scaled_landmarks = [
+        (
+            wrist[0] + (lm[0] - wrist[0]) * factor,
+            wrist[1] + (lm[1] - wrist[1]) * factor,
+            lm[2] * factor,
+        )
+        for lm in hand.landmarks
+    ]
+    scaled_hand = replace(hand, landmarks=scaled_landmarks)
+    estimator = HandScaleEstimator()
+    return estimator.estimate(scaled_hand)
+
+
+# ---------------------------------------------------------------------------
 # pytest fixtures
 # ---------------------------------------------------------------------------
 
@@ -209,3 +318,15 @@ def sample_landmarks() -> dict:
 def occlusion_sequence() -> list[dict]:
     """The frame sequence from occlusion_sequence.json."""
     return load_fixture('occlusion_sequence.json')['frames']
+
+
+@pytest.fixture
+def gesture_trajectories() -> dict:
+    """All 6 dynamic-gesture trajectory fixtures."""
+    return load_fixture('gesture_trajectories.json')
+
+
+@pytest.fixture
+def swipe_negative_cases() -> dict:
+    """Negative-case trajectory fixtures for swipe rejection tests."""
+    return load_fixture('swipe_negative_cases.json')

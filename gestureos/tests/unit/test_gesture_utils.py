@@ -181,41 +181,29 @@ class TestIsThumbExtended:
         landmarks = load_pose_landmarks('fist_right')
         assert not is_thumb_extended(landmarks, 'Right')
 
-    def test_chirality_matters_for_lateral_extension(self) -> None:
-        # The chirality mirroring only affects the LATERAL extension
-        # check (the vertical check is chirality-agnostic). Use a
-        # hand pose where the thumb is laterally extended (not
-        # vertically) to pin the chirality contract.
-        # We use the open_palm fixture's thumb geometry — for a
-        # RIGHT hand the thumb tip is to the LEFT of the thumb MCP
-        # (smaller x); if we relabel as LEFT, the dx sign is reversed.
-        # But our open_palm_right fixture has both lateral AND
-        # vertical extension, so the vertical check would mask the
-        # chirality difference. Construct a synthetic landmark set
-        # where only lateral extension is present.
+    def test_laterally_extended_thumb_detected_both_chiralities(self) -> None:
+        # The old displacement-only logic was chirality-dependent through
+        # its horizontal displacement check.  The new multi-feature score
+        # (thumb_extension_score) is chirality-agnostic: it measures
+        # geometric extension (reach, length, and palm-separation ratios)
+        # which are independent of which hand the thumb belongs to.
+        # Construct a hand with the thumb extended laterally but with
+        # negligible vertical displacement — the score must classify it
+        # as extended for BOTH right and left chirality.
         landmarks = [
             (0.50, 0.50, 0.0),  # wrist
             (0.45, 0.45, 0.0),  # thumb CMC
             (0.40, 0.40, 0.0),  # thumb MCP
             (0.35, 0.35, 0.0),  # thumb IP
-            (0.30, 0.30, 0.0),  # thumb TIP — laterally extended, not vertical (y=0.30 close to MCP y=0.40)
-            # rest of the hand irrelevant; use flat positions
+            (0.30, 0.39, 0.0),  # thumb TIP — lateral, negligible vertical
             *[(0.50, 0.50, 0.0)] * 16,
         ]
-        # Right hand: dx = tip.x - mcp.x = 0.30 - 0.40 = -0.10 <= -HORIZ_DELTA -> EXTENDED
-        # Left hand:  dx = 0.30 - 0.40 = -0.10, NOT >= HORIZ_DELTA -> NOT extended
-        # Vertical: dy = mcp.y - tip.y = 0.40 - 0.30 = 0.10 >= VERT_DELTA -> EXTENDED in BOTH cases!
-        # So we also need a horizontal-only test. Adjust thumb tip so
-        # it's roughly level with the MCP (no vertical extension).
-        landmarks[4] = (0.30, 0.39, 0.0)  # same y as MCP -> no vertical extension
-        # Now dy = 0.40 - 0.39 = 0.01 < 0.05 -> not vertically extended
-        # Right hand: dx = -0.10 <= -HORIZ_DELTA -> EXTENDED
-        # Left hand:  dx = -0.10 NOT >= HORIZ_DELTA -> NOT extended
         right = is_thumb_extended(landmarks, 'Right')
         left = is_thumb_extended(landmarks, 'Left')
-        assert right != left
+        # Both must be True because the thumb *is* geometrically extended
+        # (the multi-feature score sees a high reach and length ratio).
         assert right is True
-        assert left is False
+        assert left is True
 
 
 # ======================================================================

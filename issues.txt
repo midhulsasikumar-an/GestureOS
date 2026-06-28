@@ -1,0 +1,25 @@
+1. Issue ID: GI-001 — Palm orientation occasionally misclassified
+
+Observed:
+
+Palm facing camera is sometimes reported as BACK or SIDE.
+Misclassification appears to vary with hand angle and lighting.
+
+Current Impact:
+
+Low (Developer Mode only).
+Does not currently affect gesture execution because actions are not yet implemented.
+
+Investigate after:
+
+Completion of Checkpoint 4 or before the final gesture/action integration.
+
+Potential Improvements:
+
+Review orientation heuristic.
+Tune orientation thresholds.
+Add orientation confidence rather than a hard label.
+Improve robustness under different lighting and viewing angles.
+Validate against front/side/back test cases.
+
+2. Consider moving all ActivationGate state changes onto the Qt main thread before v1.0.

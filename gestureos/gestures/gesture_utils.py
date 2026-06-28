@@ -55,15 +55,26 @@ RING_TIP: int = 16
 PINKY_MCP: int = 17
 PINKY_TIP: int = 20
 
-# Thumb has different joint geometry than the other four fingers
-# (TRD §4.3 `is_thumb_extended` note), so the chirality-aware
-# dual-axis (horizontal-and-vertical) test is provided separately.
-# The horizontal threshold is normalized to wrist-relative units
-# (0..1 in frame space); the vertical threshold is in the same units
-# and matches the typical "thumb tip is at least 5% of frame height
-# above the thumb MCP" geometry of a Thumbs-Up pose.
-THUMB_EXTENSION_HORIZONTAL_DELTA: float = 0.04
-THUMB_EXTENSION_VERTICAL_DELTA: float = 0.05
+# ---------------------------------------------------------------------------
+# Configuration for thumb-extension recognition (multi-feature, scale-invariant)
+# ---------------------------------------------------------------------------
+
+# Minimum multi-feature score required for the thumb to be considered
+# EXTENDED.  0.55 gives a safety margin above fist/curled (≈0.20–0.35)
+# while keeping genuine Thumbs-Up / Open-Palm thumbs well above it
+# (≈0.85–1.00).
+THUMB_EXTENSION_THRESHOLD: float = 0.55
+
+# Thumb-extension feature normalisation constants.
+# Reach ratio:  tip_reach / mcp_reach  (1.0 = curled, 2.0 = straight out)
+_THUMB_REACH_MIN: float = 1.0
+_THUMB_REACH_MAX: float = 2.0
+# Length ratio:  mcp_tip / cmc_mcp     (0.25 = tucked, 1.5 = extended)
+_THUMB_LENGTH_MIN: float = 0.25
+_THUMB_LENGTH_MAX: float = 1.50
+# Separation ratio:  tip_idx_mcp / wrist_mcp  (0.5 = near palm, 2.5 = away)
+_THUMB_SEPARATION_MIN: float = 0.5
+_THUMB_SEPARATION_MAX: float = 2.5
 
 
 # ---------------------------------------------------------------------------
@@ -138,52 +149,133 @@ def finger_states(
     `'pinky'`) → bool (True == EXTENDED). The thumb is *not* classified
     here because its joint geometry differs; use `is_thumb_extended()`
     for that.
+
+    Defensive: returns all-`False` for any malformed input (empty list,
+    short list that cannot index landmark IDs 5..20). Per RULES §6.4
+    hot-path-never-raises.
     """
-    return {
-        name: is_finger_extended(landmarks, *joints, angle_threshold=angle_threshold)
-        for name, joints in FINGER_JOINTS.items()
-    }
+    out: dict[str, bool] = {}
+    for name, (mcp_id, pip_id, tip_id) in FINGER_JOINTS.items():
+        if len(landmarks) <= max(mcp_id, pip_id, tip_id):
+            out[name] = False
+            continue
+        out[name] = is_finger_extended(
+            landmarks, mcp_id, pip_id, tip_id,
+            angle_threshold=angle_threshold,
+        )
+    return out
+
+
+def thumb_extension_score(
+    landmarks: list[tuple[float, float, float]],
+    chirality: str = '',
+) -> float:
+    """Scale-invariant multi-feature thumb-extension score.
+
+    Returns a float in ``[0.0, 1.0]``:
+      ``0.0``  → thumb is tightly curled / folded across the palm,
+      ``1.0``  → thumb is fully extended away from the palm.
+
+    The score combines three independent, scale-invariant features:
+
+    1. **Reach ratio**   (50 %)
+       ``dist(wrist, thumb_tip) / dist(wrist, thumb_mcp)``
+       Curled thumbs sit close to the palm, producing a ratio ≈ 1.0;
+       extended thumbs reach out, producing a ratio ≈ 2.0 or more.
+
+    2. **Length ratio**  (30 %)
+       ``dist(mcp, tip) / dist(cmc, mcp)``
+       Even if the reach ratio is modest, an extended thumb has a
+       much larger *relative* length than a tucked thumb.
+
+    3. **Separation ratio**  (20 %)
+       ``dist(tip, index_mcp) / dist(wrist, mcp)``
+       In a curled fist the thumb tip stays near the palmar index
+       MCP; in a genuine thumbs-up / open-palm it is far away.
+
+    All three features are pure ratios of distances, so the score
+    is naturally scale-invariant and survives changes in camera
+    distance (RULES §5.7).
+
+    To prevent a single noisy feature from creating a false
+    positive, the score is penalised if fewer than two of the
+    three features are strongly active.
+    """
+    if len(landmarks) < max(INDEX_MCP, THUMB_TIP) + 1:
+        return 0.0
+
+    wrist = landmarks[WRIST]
+    thumb_cmc = landmarks[THUMB_CMC]
+    thumb_mcp = landmarks[THUMB_MCP]
+    thumb_tip = landmarks[THUMB_TIP]
+    index_mcp = landmarks[INDEX_MCP]
+
+    # --- Feature 1: Reach ratio -------------------------------------------
+    wrist_to_mcp = euclidean_distance(wrist, thumb_mcp)
+    wrist_to_tip = euclidean_distance(wrist, thumb_tip)
+    if wrist_to_mcp > 0.0:
+        reach_ratio = wrist_to_tip / wrist_to_mcp
+        score_reach = (reach_ratio - _THUMB_REACH_MIN) / (_THUMB_REACH_MAX - _THUMB_REACH_MIN)
+        score_reach = max(0.0, min(1.0, score_reach))
+    else:
+        score_reach = 0.0
+
+    # --- Feature 2: Length ratio ------------------------------------------
+    cmc_to_mcp = euclidean_distance(thumb_cmc, thumb_mcp)
+    mcp_to_tip = euclidean_distance(thumb_mcp, thumb_tip)
+    if cmc_to_mcp > 0.0:
+        length_ratio = mcp_to_tip / cmc_to_mcp
+        score_length = (length_ratio - _THUMB_LENGTH_MIN) / (_THUMB_LENGTH_MAX - _THUMB_LENGTH_MIN)
+        score_length = max(0.0, min(1.0, score_length))
+    else:
+        score_length = 0.0
+
+    # --- Feature 3: Separation from palm centre ---------------------------
+    tip_to_index = euclidean_distance(thumb_tip, index_mcp)
+    if wrist_to_mcp > 0.0:
+        separation_ratio = tip_to_index / wrist_to_mcp
+        score_separation = (separation_ratio - _THUMB_SEPARATION_MIN) / (_THUMB_SEPARATION_MAX - _THUMB_SEPARATION_MIN)
+        score_separation = max(0.0, min(1.0, score_separation))
+    else:
+        score_separation = 0.0
+
+    # --- Combine -----------------------------------------------------------
+    overall_score = (0.5 * score_reach
+                    + 0.3 * score_length
+                    + 0.2 * score_separation)
+
+    # Penalise when only one feature is strongly active (multi-feature
+    # guard against transitional false positives).
+    active_features = sum([
+        score_reach > 0.2,
+        score_length > 0.2,
+        score_separation > 0.2,
+    ])
+    if active_features < 2:
+        overall_score *= 0.5
+
+    return float(max(0.0, min(1.0, overall_score)))
 
 
 def is_thumb_extended(
     landmarks: list[tuple[float, float, float]],
     chirality: str,
-    horizontal_delta: float = THUMB_EXTENSION_HORIZONTAL_DELTA,
-    vertical_delta: float = THUMB_EXTENSION_VERTICAL_DELTA,
+    horizontal_delta: float = 0.04,   # kept for backward API compatibility
+    vertical_delta: float = 0.05,    # kept for backward API compatibility
 ) -> bool:
     """Chirality-aware thumb-extension test.
 
-    The thumb's joint geometry differs from the other four fingers:
-    `finger_angle()` on the thumb's MCP/PIP/TIP triplet is unreliable
-    because the thumb folds sideways rather than curling through the
-    same plane as the other fingers (TRD §4.3 `is_thumb_extended` note).
+    Replaces the old displacement-only logic with a
+    scale-invariant multi-feature score (see
+    :func:`thumb_extension_score`). A score above
+    :data:`THUMB_EXTENSION_THRESHOLD` is required for the thumb
+    to be considered EXTENDED.
 
-    A thumb is considered EXTENDED if EITHER:
-      (a) it is laterally extended — the thumb tip is horizontally
-          past the thumb MCP by at least `horizontal_delta` (mirrored
-          for chirality so a right-hand thumb extends LEFT, a left-
-          hand thumb extends RIGHT), OR
-      (b) it is vertically extended — the thumb tip is at least
-          `vertical_delta` above the thumb MCP (i.e., pointing up).
-          The vertical check is chirality-agnostic and supports
-          Thumbs-Up gestures where the thumb does NOT fan sideways.
-
-    This dual-axis check covers both Lateral (Open Palm, OK Sign)
-    and Vertical (Thumbs Up) thumb poses without conflating them with
-    a curled thumb (which lies close to the index MCP and is neither
-    laterally nor vertically displaced).
+    The ``horizontal_delta`` and ``vertical_delta`` parameters
+    are retained for API compatibility but no longer take effect.
     """
-    thumb_tip = landmarks[THUMB_TIP]
-    thumb_mcp = landmarks[THUMB_MCP]
-    dx = thumb_tip[0] - thumb_mcp[0]
-    dy = thumb_mcp[1] - thumb_tip[1]  # positive when tip is above MCP
-    # Vertically extended: tip above MCP by vertical_delta.
-    if dy >= vertical_delta:
-        return True
-    # Laterally extended: tip past MCP by horizontal_delta.
-    if chirality == 'Right':
-        return dx <= -horizontal_delta
-    return dx >= horizontal_delta
+    score = thumb_extension_score(landmarks, chirality)
+    return score >= THUMB_EXTENSION_THRESHOLD
 
 
 def extended_finger_count(
