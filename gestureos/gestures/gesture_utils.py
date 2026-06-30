@@ -336,3 +336,112 @@ def all_fingers_extended(
     """Convenience predicate: all five fingers extended (Open Palm)."""
     states = finger_states(landmarks)
     return all(states.values()) and is_thumb_extended(landmarks, chirality)
+
+
+def fist_compactness_ratio(
+    landmarks: list[tuple[float, float, float]],
+    palm_width: float,
+) -> float:
+    """Average normalized wrist-to-fingertip distance for the four
+    non-thumb fingers.
+
+    Used by :func:`gestures.static_recognizer.detect_fist` as the
+    second independent geometric signal: a real Closed Fist has
+    fingertips pulled in close to the wrist, while a hand with
+    loosely-curled but extended fingers (or a transitional pose)
+    will show a larger ratio.
+
+    Args:
+        landmarks: 21-element MediaPipe landmark list.
+        palm_width: hand scale reference (typically
+            ``HandData.scale.palm_width``). Used as the normalization
+            denominator so the ratio is scale-invariant (RULES §5.7).
+
+    Returns:
+        Average ``dist(wrist, fingertip) / palm_width`` across the
+        four non-thumb fingertips. Returns ``math.inf`` if
+        ``palm_width <= 0.0`` so the caller can detect the
+        degenerate case explicitly (RULES §6.4
+        hot-path-never-raises).
+    """
+    if palm_width <= 0.0:
+        return math.inf
+    if len(landmarks) <= max(WRIST, INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP):
+        return math.inf
+    wrist = landmarks[WRIST]
+    tips = (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
+    avg = sum(euclidean_distance(wrist, landmarks[t]) for t in tips) / len(tips)
+    return avg / palm_width
+
+
+def thumb_index_alignment_ratio(
+    landmarks: list[tuple[float, float, float]],
+) -> float:
+    """Cosine similarity between the wrist→thumb-tip and
+    wrist→index-tip direction vectors.
+
+    Used by :func:`gestures.static_recognizer.detect_pinch` as the
+    second independent geometric signal: a deliberate Pinch has
+    the thumb tip and index tip meeting at a single point, so
+    the two wrist→tip vectors point in nearly the same direction
+    (cosine similarity ≈ 1.0). A coincidental close-proximity
+    (e.g., user points with index and the curled thumb happens
+    to be near the index) yields a low cosine similarity.
+
+    Args:
+        landmarks: 21-element MediaPipe landmark list.
+
+    Returns:
+        Float in ``[0.0, 1.0]`` (cosine similarity clamped to the
+        non-negative range — opposite-direction vectors score 0.0,
+        which is the right answer for "not aligned" rather than
+        -1.0). Returns 0.0 if the input is malformed or one of
+        the vectors has zero length.
+    """
+    if len(landmarks) <= max(WRIST, THUMB_TIP, INDEX_TIP):
+        return 0.0
+    wx, wy, _ = landmarks[WRIST]
+    tx, ty, _ = landmarks[THUMB_TIP]
+    ix, iy, _ = landmarks[INDEX_TIP]
+    v1x, v1y = tx - wx, ty - wy
+    v2x, v2y = ix - wx, iy - wy
+    m1 = math.hypot(v1x, v1y)
+    m2 = math.hypot(v2x, v2y)
+    if m1 == 0.0 or m2 == 0.0:
+        return 0.0
+    cos = (v1x * v2x + v1y * v2y) / (m1 * m2)
+    return float(max(0.0, min(1.0, cos)))
+
+
+def remaining_fingers_curled_score(
+    landmarks: list[tuple[float, float, float]],
+    palm_width: float,
+) -> float:
+    """Average normalized wrist-to-fingertip distance for the
+    three remaining non-thumb, non-index fingers (middle, ring,
+    pinky).
+
+    Used by :func:`gestures.static_recognizer.detect_pinch` as the
+    third independent geometric signal: a Pinch has these three
+    fingertips pulled in close to the palm (low score), while a
+    pose where middle/ring/pinky are extended (e.g., Open Palm or
+    Three Fingers) yields a high score and is rejected.
+
+    Args:
+        landmarks: 21-element MediaPipe landmark list.
+        palm_width: hand scale reference (typically
+            ``HandData.scale.palm_width``).
+
+    Returns:
+        Average ``dist(wrist, fingertip) / palm_width`` across
+        middle / ring / pinky. Returns ``math.inf`` if
+        ``palm_width <= 0.0`` (RULES §6.4).
+    """
+    if palm_width <= 0.0:
+        return math.inf
+    if len(landmarks) <= max(WRIST, MIDDLE_TIP, RING_TIP, PINKY_TIP):
+        return math.inf
+    wrist = landmarks[WRIST]
+    tips = (MIDDLE_TIP, RING_TIP, PINKY_TIP)
+    avg = sum(euclidean_distance(wrist, landmarks[t]) for t in tips) / len(tips)
+    return avg / palm_width

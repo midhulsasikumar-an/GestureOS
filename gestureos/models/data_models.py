@@ -40,15 +40,31 @@ class HandData:
     """Per-frame per-hand landmark container.
 
     Implements TRD §6.1 (extended in v1.2 with scale, gesture_eligible,
-    is_retained).
+    is_retained; extended in CP-4 Tracking Stabilization with
+    tracking_confidence, status, status_reason).
     """
     landmarks: list[tuple[float, float, float]]   # 21 (x, y, z), normalized
-    chirality: str                                  # 'Left' | 'Right'
+    chirality: str                                  # 'Left' | 'Right' | None
     confidence: float
     role: str | None = None                         # 'HAND_A' | 'HAND_B'
     scale: HandScale | None = None                   # NEW v1.2 — populated by HandScaleEstimator
     gesture_eligible: bool = True                     # NEW v1.2 — set by PrimaryHandFilter
     is_retained: bool = False                          # NEW v1.2 — True if from OcclusionHandler bridge
+    # NEW CP-4 Tracking Stabilization — per-hand diagnostic state. All
+    # fields have defaults so existing call sites and `dataclasses.replace`
+    # usage continue to work. These fields are populated by the
+    # tracking/CP-2 stages and consumed by the Developer Mode debug panel.
+    #   tracking_confidence: a separate per-hand tracking score where
+    #     MediaPipe exposes one; None when MediaPipe's API does not
+    #     surface a separate score (MediaPipe 0.10.14 currently does
+    #     not — `confidence` carries the combined presence + handedness
+    #     score).
+    #   status: 'accepted' | 'retained' | 'filtered' | 'discarded'.
+    #   status_reason: short string explaining the status; None for
+    #     'accepted'. Used by the debug panel and structured logs.
+    tracking_confidence: float | None = None
+    status: str = 'accepted'
+    status_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------

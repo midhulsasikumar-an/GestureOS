@@ -11,7 +11,10 @@ from __future__ import annotations
 import pytest
 
 from gestures.static_recognizer import (
+    FIST_COMPACTNESS_THRESHOLD,
+    PINCH_ALIGNMENT_THRESHOLD,
     PINCH_NORMALIZED_DISTANCE_THRESHOLD,
+    PINCH_REMAINING_CURL_THRESHOLD,
     STATIC_GESTURE_RULES,
     detect_fist,
     detect_ok_sign,
@@ -42,6 +45,15 @@ class TestConstants:
 
     def test_static_rules_count_is_eight(self) -> None:
         assert len(STATIC_GESTURE_RULES) == 8
+
+    def test_fist_compactness_threshold_pinned(self) -> None:
+        assert FIST_COMPACTNESS_THRESHOLD == 1.5
+
+    def test_pinch_alignment_threshold_pinned(self) -> None:
+        assert PINCH_ALIGNMENT_THRESHOLD == 0.85
+
+    def test_pinch_remaining_curl_threshold_pinned(self) -> None:
+        assert PINCH_REMAINING_CURL_THRESHOLD == 2.0
 
 
 # ======================================================================
@@ -357,18 +369,18 @@ class TestOkSign:
         # what disambiguates OK Sign from Pinch. The ConflictResolver
         # picks one winner; here we assert that the OK Sign rule itself
         # produces an 'ok_sign' result on the OK Sign fixture, AND that
-        # the Pinch rule does NOT (because the three-finger constraint
-        # is not enforced by detect_pinch).
+        # the Pinch rule does NOT (because detect_pinch now enforces its
+        # own three-finger remaining-curled check, which rejects the OK
+        # Sign fixture where middle / ring / pinky are extended).
         h = make_hand_with_scale(pose_name='ok_sign_right', role='HAND_A')
         ok_result = detect_ok_sign(h)
         pinch_result = detect_pinch(h)
         assert ok_result is not None
         assert ok_result.gesture_name == 'ok_sign'
-        # detect_pinch has no three-finger check; it MAY also fire on the
-        # OK Sign fixture because the thumb-index distance is small. The
-        # important property is that BOTH candidates are produced and
-        # ConflictResolver (test_conflict_resolver.py) handles the tie.
-        # We just confirm the OK Sign rule itself returns 'ok_sign'.
+        assert pinch_result is None, (
+            'detect_pinch must reject OK Sign fixture because middle/'
+            'ring/pinky are extended (remaining-fingers curled check)'
+        )
 
     def test_pinch_fixture_not_ok_sign(self) -> None:
         # Reverse direction: a Pinch fixture should NOT trigger OK Sign

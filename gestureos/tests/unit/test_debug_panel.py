@@ -44,6 +44,10 @@ def make_hand(
     scale: HandScale | None = None,
     is_retained: bool = False,
     gesture_eligible: bool = True,
+    # CP-4 Tracking Stabilization fields
+    tracking_confidence: float | None = None,
+    status: str = 'accepted',
+    status_reason: str | None = None,
 ) -> HandData:
     if landmarks is None:
         landmarks = [(0.5 + 0.01 * (i % 3 - 1), 0.5 - 0.02 * (i // 3), 0.0)
@@ -56,6 +60,9 @@ def make_hand(
         scale=scale,
         is_retained=is_retained,
         gesture_eligible=gesture_eligible,
+        tracking_confidence=tracking_confidence,
+        status=status,
+        status_reason=status_reason,
     )
 
 
@@ -534,3 +541,98 @@ class TestPerformanceDiscipline:
         frame_id_before = id(frame)
         out = render_debug_panel(frame, [], fps=29.0)
         assert id(out) == frame_id_before
+
+
+# ======================================================================
+# CP-4 Tracking Stabilization: status and tracking-confidence fields
+# ======================================================================
+
+class TestFormatStatus:
+    """_format_status renders the per-hand diagnostic status correctly.
+    The STATUS_LABELS mapping uppercases the value for display."""
+
+    def test_accepted_no_reason(self) -> None:
+        from overlay.debug_panel import _format_status
+        hand = make_hand(status='accepted', status_reason=None)
+        out = _format_status(hand)
+        assert out == 'ACCEPTED'
+
+    def test_retained_with_reason(self) -> None:
+        from overlay.debug_panel import _format_status
+        hand = make_hand(status='retained', status_reason='occlusion_bridge')
+        out = _format_status(hand)
+        assert 'RETAINED' in out
+        assert 'occlusion_bridge' in out
+
+    def test_filtered_with_reason(self) -> None:
+        from overlay.debug_panel import _format_status
+        hand = make_hand(status='filtered', status_reason='dominant_hand_mode')
+        out = _format_status(hand)
+        assert 'FILTERED' in out
+        assert 'dominant_hand_mode' in out
+
+    def test_discarded_with_reason(self) -> None:
+        from overlay.debug_panel import _format_status
+        hand = make_hand(status='discarded', status_reason='handedness_missing')
+        out = _format_status(hand)
+        assert 'DISCARDED' in out
+        assert 'handedness_missing' in out
+
+    def test_accepted_with_none_reason_shows_bare_status(self) -> None:
+        from overlay.debug_panel import _format_status
+        hand = make_hand(status='accepted', status_reason=None)
+        out = _format_status(hand)
+        assert out == 'ACCEPTED'
+        assert '(' not in out
+
+
+class TestFormatTrackingConfidence:
+    """_format_tracking_confidence renders the per-hand tracking score
+    or the MediaPipe-version note when None."""
+
+    def test_tracking_confidence_none_shows_note(self) -> None:
+        from overlay.debug_panel import _format_tracking_confidence
+        hand = make_hand(tracking_confidence=None)
+        out = _format_tracking_confidence(hand)
+        assert 'n/a' in out.lower()
+        assert '0.10.14' in out
+
+    def test_tracking_confidence_value_formatted(self) -> None:
+        from overlay.debug_panel import _format_tracking_confidence
+        hand = make_hand(tracking_confidence=0.72)
+        out = _format_tracking_confidence(hand)
+        assert out == '0.720'
+
+
+class TestRenderWithStatusFields:
+    """Smoke tests: the panel must render with the new status fields
+    populated on each hand, without crashing."""
+
+    def test_hand_with_retained_status(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hand = make_hand(role='HAND_A', status='retained',
+                         status_reason='occlusion_bridge')
+        out = render_debug_panel(frame, [hand], fps=29.0)
+        assert out is frame
+
+    def test_hand_with_filtered_status(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hand = make_hand(role='HAND_B', status='filtered',
+                         status_reason='dominant_hand_mode')
+        out = render_debug_panel(frame, [hand], fps=29.5)
+        assert out is frame
+
+    def test_hand_with_discarded_status(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hand = make_hand(role=None, status='discarded',
+                         status_reason='handedness_missing')
+        out = render_debug_panel(frame, [hand], fps=30.0)
+        assert out is frame
+
+    def test_two_hands_mixed_statuses(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        a = make_hand(role='HAND_A', status='accepted', status_reason=None)
+        b = make_hand(role='HAND_B', status='filtered',
+                      status_reason='dominant_hand_mode')
+        out = render_debug_panel(frame, [a, b], fps=30.0)
+        assert out is frame

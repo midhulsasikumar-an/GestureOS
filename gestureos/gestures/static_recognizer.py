@@ -40,8 +40,11 @@ from gestures.gesture_utils import (
     WRIST,
     euclidean_distance,
     finger_states,
+    fist_compactness_ratio,
     is_thumb_extended,
+    remaining_fingers_curled_score,
     thumb_extension_score,
+    thumb_index_alignment_ratio,
 )
 from models.data_models import GestureResult, HandData
 
@@ -68,10 +71,49 @@ OPEN_PALM_SPREAD_THRESHOLD: float = 0.55
 #: is saturated at 1.0).
 OPEN_PALM_SPREAD_CONFIDENCE_CEILING: float = 0.70
 
+#: Average normalized wrist-to-fingertip distance below which a Fist
+#: is considered compact. A genuine Closed Fist has the four
+#: non-thumb fingertips pulled in close to the wrist; a transitional
+#: pose or a loosely-closed hand has the fingertips further out and
+#: fails this check. Expressed in `palm_width`-normalized units
+#: (scale-invariant per RULES §5.7).
+#:
+#: 1.5 hand-scales is generous enough that the canonical fist_right
+#: fixture (compactness ≈ 1.0–1.4) passes comfortably, and tight
+#: enough that an Open Palm (compactness ≈ 3–4) is cleanly rejected.
+FIST_COMPACTNESS_THRESHOLD: float = 1.5
+
+#: Confidence ceiling for Fist compactness (used to scale the
+#: compactness-based confidence gradient). At or below this
+#: compactness, confidence is saturated at 1.0; above the
+#: :data:`FIST_COMPACTNESS_THRESHOLD` the gesture is rejected
+#: outright.
+FIST_COMPACTNESS_CONFIDENCE_CEILING: float = 0.8
+
+#: Minimum cosine-similarity between the wrist→thumb-tip and
+#: wrist→index-tip direction vectors for a Pinch to be accepted.
+#: A genuine Pinch has the two vectors aligned (cosine ≈ 1.0);
+#: a coincidental close-proximity pose has them misaligned.
+#: 0.85 is the empirical lower bound observed on the canonical
+#: pinch_right fixture.
+PINCH_ALIGNMENT_THRESHOLD: float = 0.85
+
+#: Average normalized wrist-to-fingertip distance for middle/ring/
+#: pinky below which the "remaining fingers are curled" Pinch
+#: constraint is satisfied. Pinch requires the three non-index,
+#: non-thumb fingers to be pulled in (they do not participate in
+#: the pinch action). 2.0 hand-scales accommodates the synthetic
+#: pinch_right fixture while rejecting Open Palm and Three Fingers.
+PINCH_REMAINING_CURL_THRESHOLD: float = 2.0
+
 #: Fixed high-confidence value for boolean-pattern gestures (Three
-#: Fingers, Peace Sign, Fist, Thumbs Up/Down) per AI Dev Guide §7.2:
+#: Fingers, Peace Sign, Thumbs Up/Down) per AI Dev Guide §7.2:
 #: "a fixed high-confidence constant (e.g., 0.9) is acceptable and
 #: matches the pattern already used for similar boolean-rule gestures".
+#:
+#: NOTE: Fist, Pinch, Open Palm, and OK Sign now use blended
+#: confidence from multiple signals (multi-signal discipline per
+#: PRD FR-MS-01), so the constant is no longer applied to them.
 BOOLEAN_GESTURE_CONFIDENCE: float = 0.92
 
 #: Fixed confidence value used by the no-scale fallback detection
@@ -186,18 +228,24 @@ def detect_open_palm(hand: HandData) -> GestureResult | None:
 
 def detect_fist(hand: HandData) -> GestureResult | None:
     """Recognize the Closed Fist gesture: all four non-thumb fingers
-    CURLED (via finger-state Priority 1). Thumb state is unconstrained
-    (PRD §4.3 Fist rule summary).
+    CURLED AND the four fingertips are pulled in close to the wrist.
 
     Implements PRD §4.3 (Closed Fist gesture rule). Default action:
     Hold / Drag start.
 
-    Signals used: finger-state pattern (Priority 1, all four
-    non-thumb fingers CURLED). One Priority-1 signal is sufficient
-    here because the fist pattern is geometrically unambiguous in
-    the boolean state space; the second signal comes from the
-    *absence* of an Open Palm match (the engine runs both rules
-    simultaneously and ConflictResolver disambiguates).
+    Signals used (two independent signals per PRD FR-MS-01):
+      - four-finger CURLED state (Priority 1, boolean)
+      - normalized fist compactness ratio (Priority 3): the average
+        wrist-to-fingertip distance for the four non-thumb fingers,
+        normalized by ``palm_width``. A genuine fist has the
+        fingertips pulled in close; a loosely-curled hand with
+        fingers barely past the PIP threshold has a larger ratio
+        and is rejected.
+
+    The compactness signal is what distinguishes a real fist from a
+    transitional pose where all four fingers are technically
+    "curled" by the 160° angle threshold but the hand is not
+    actually closed.
     """
     if not _has_min_landmarks(hand) or hand.scale is None:
         return None  # PRD FR-SC-04
@@ -206,9 +254,32 @@ def detect_fist(hand: HandData) -> GestureResult | None:
     if any(states.values()):
         return None  # any non-thumb finger extended -> not a fist
 
+    palm_width = _scale_palm_width(hand)
+    if palm_width <= 0.0:
+        return None
+
+    # Priority 3: compactness — average wrist-to-fingertip distance
+    # normalized by palm_width. A tight fist has a small ratio; a
+    # hand with fingers barely curled has a larger ratio and fails
+    # the threshold.
+    compactness = fist_compactness_ratio(hand.landmarks, palm_width)
+    if compactness >= FIST_COMPACTNESS_THRESHOLD:
+        return None  # fingertips too far from the wrist -> not a fist
+
+    # Confidence blends compactness strength with the boolean
+    # finger-state gate. A tight fist (compactness ≈ 0.8) saturates
+    # the compactness gradient at 1.0; a fist right at the threshold
+    # (compactness ≈ 1.5) scores 0.0 on the gradient, yielding an
+    # overall confidence of 0.6 from the binary-gate floor.
+    compactness_score = max(
+        0.0,
+        1.0 - compactness / FIST_COMPACTNESS_CONFIDENCE_CEILING,
+    )
+    confidence = 0.6 + 0.4 * compactness_score
+
     return GestureResult(
         gesture_name='fist',
-        confidence=BOOLEAN_GESTURE_CONFIDENCE,
+        confidence=float(confidence),
         is_dynamic=False,
         hand_role=hand.role if hand.role is not None else '',
         timestamp=time.time(),
@@ -220,16 +291,28 @@ def detect_fist(hand: HandData) -> GestureResult | None:
 # ---------------------------------------------------------------------------
 
 def detect_pinch(hand: HandData) -> GestureResult | None:
-    """Recognize the Pinch gesture: normalized thumb-index distance
-    below 0.35 (TRD §4.3 reference implementation).
+    """Recognize the Pinch gesture: thumb and index tips in close
+    proximity, wrist→thumb and wrist→index vectors aligned, AND
+    the remaining three fingers (middle / ring / pinky) curled in
+    toward the palm.
 
     Implements PRD §4.3 + §5.2 (Pinch rule and scale-invariance worked
     example). Default action: Click / Select.
 
-    Signals used: normalized thumb-index distance (Priority 3,
-    `palm_width` denominator) + thumb-index landmark positions
-    (Priority 2, the two specific landmark IDs used). Two independent
-    signals required per PRD FR-MS-01.
+    Three independent signals per PRD FR-MS-01:
+      - normalized thumb-index distance (Priority 3): the primary
+        proximity check; must be below 0.35 hand-scales.
+      - thumb-index alignment ratio (Priority 2): cosine similarity
+        between the wrist→thumb-tip and wrist→index-tip direction
+        vectors. A genuine pinching gesture has the two fingertips
+        meeting at a single point so the vectors align; a coincidental
+        close-proximity (e.g., pointing with index while curled thumb
+        happens to lie near it) has misaligned vectors and is rejected.
+      - remaining-fingers curled score (Priority 3): average normalized
+        wrist-to-fingertip distance for middle / ring / pinky. In a
+        genuine Pinch these three fingers are pulled in toward the palm
+        (they do not participate); an Open Palm, Peace Sign, or Three
+        Fingers pose has them extended and fails the threshold.
     """
     if not _has_min_landmarks(hand) or hand.scale is None:
         return None  # PRD FR-SC-04
@@ -238,14 +321,29 @@ def detect_pinch(hand: HandData) -> GestureResult | None:
     if palm_width <= 0.0:
         return None
 
+    # Priority 3: normalized thumb-index distance.
     raw_dist = euclidean_distance(hand.landmarks[THUMB_TIP], hand.landmarks[INDEX_TIP])
-    normalized_dist = raw_dist / palm_width  # Priority 3: NEVER raw (PRD §5.2)
+    normalized_dist = raw_dist / palm_width
     if normalized_dist >= PINCH_NORMALIZED_DISTANCE_THRESHOLD:
         return None
 
-    # Confidence: 1.0 at zero distance, descending linearly to 0.0 at
-    # the threshold (TRD §4.3 reference implementation).
-    confidence = 1.0 - (normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD)
+    # Priority 2: thumb-index alignment ratio.
+    alignment = thumb_index_alignment_ratio(hand.landmarks)
+    if alignment < PINCH_ALIGNMENT_THRESHOLD:
+        return None
+
+    # Priority 3: remaining three fingers curled.
+    if remaining_fingers_curled_score(hand.landmarks, palm_width) >= PINCH_REMAINING_CURL_THRESHOLD:
+        return None
+
+    # Blended confidence: three binary gates cleared yields a floor of
+    # 0.6, plus the proximity gradient (0 at threshold, 1 at perfect
+    # contact) contributes up to 0.4 additional.
+    distance_score = max(
+        0.0,
+        1.0 - normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD,
+    )
+    confidence = 0.6 + 0.4 * distance_score
 
     return GestureResult(
         gesture_name='pinch',

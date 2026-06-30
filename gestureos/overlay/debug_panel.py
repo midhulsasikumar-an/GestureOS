@@ -18,10 +18,15 @@ What this panel visualizes (per the Developer Mode spec):
         - Hand ID (HAND_A / HAND_B)              — `hand.role`
         - MediaPipe chirality                   — `hand.chirality`
         - Detection confidence                  — `hand.confidence`
-                                                  (MediaPipe returns one combined score
-                                                  per hand; shown as both detection and
-                                                  tracking confidence with a note)
-        - Tracking confidence                   — same combined score (see above)
+                                                  (MediaPipe's per-hand combined score)
+        - Tracking confidence                   — `hand.tracking_confidence`
+                                                  (None on MediaPipe 0.10.14; panel
+                                                  shows the explanatory note)
+        - Per-hand status                       — `hand.status` rendered as
+                                                  ACCEPTED / RETAINED / FILTERED /
+                                                  DISCARDED plus the discard reason
+                                                  when present (CP-4 Tracking
+                                                  Stabilization)
         - Estimated hand scale                  — `hand.scale.smoothed_scale`,
                                                   palm_width, palm_height, bounding_box
                                                   (when populated by HandScaleEstimator)
@@ -96,6 +101,25 @@ PANEL_MIN_HEIGHT_PX: int = 60   # smallest drawable panel
 #: text is much shorter than this).
 PANEL_MAX_WIDTH_FRACTION: float = 0.42
 
+# CP-4 Tracking Stabilization — per-hand status values rendered in the
+# panel. These mirror the constants in `tracking.hand_detector`; the
+# debug panel reads them off `HandData.status` / `HandData.status_reason`
+# directly and the strings are stable for the operator's eye.
+STATUS_LABELS: dict[str, str] = {
+    'accepted':  'ACCEPTED',
+    'retained':  'RETAINED',
+    'filtered':  'FILTERED',
+    'discarded': 'DISCARDED',
+}
+
+#: A short note shown on the panel when MediaPipe did not expose a
+#: separate per-hand tracking confidence score. MediaPipe 0.10.14
+#: returns a single combined score (presence + handedness) on
+#: `handedness.classification[0].score`; `HandData.confidence` is
+#: populated from that field. The separate `tracking_confidence`
+#: field is therefore `None` for every frame in 0.10.14.
+TRACKING_CONF_NA_NOTE: str = 'n/a (not exposed by MediaPipe 0.10.14)'
+
 
 # ---------------------------------------------------------------------------
 # Optional per-frame gesture state (forward-compatible)
@@ -156,6 +180,33 @@ def _palm_orientation(hand: HandData) -> str:
     if delta > 0.02:
         return "BACK"
     return "SIDE"
+
+
+def _format_status(hand: HandData) -> str:
+    """Format the per-hand status (accepted / retained / filtered /
+    discarded) and the discard reason when present.
+
+    CP-4 Tracking Stabilization: the panel surfaces the structured
+    per-hand status set by `TrackingModule`, `OcclusionHandler`,
+    and `PrimaryHandFilter`. The status is read from
+    `HandData.status`; the reason is read from `HandData.status_reason`.
+    `accepted` hands have no reason; `filtered` / `retained` /
+    `discarded` hands always have a short reason string.
+    """
+    label = STATUS_LABELS.get(hand.status, hand.status)
+    if hand.status == 'accepted' or hand.status_reason is None:
+        return label
+    return f"{label} ({hand.status_reason})"
+
+
+def _format_tracking_confidence(hand: HandData) -> str:
+    """Format the per-hand tracking confidence. MediaPipe 0.10.14 does
+    not expose a separate tracking score; the field is `None` and the
+    panel shows the explanatory note.
+    """
+    if hand.tracking_confidence is None:
+        return TRACKING_CONF_NA_NOTE
+    return f"{hand.tracking_confidence:.3f}"
 
 
 def _format_finger_states(hand: HandData) -> str:
@@ -346,10 +397,16 @@ def render_debug_panel(
         role = hand.role if hand.role is not None else "(unassigned)"
         chirality = hand.chirality if hand.chirality else "?"
         per_hand_lines.append(f"-- Hand {i} [{role} | {chirality}] --")
-        per_hand_lines.append(
-            f"  det_conf: {hand.confidence:.3f}  "
-            f"trk_conf: {hand.confidence:.3f} (combined MediaPipe score)"
-        )
+        # CP-4 Tracking Stabilization: split detection and tracking
+        # confidence onto separate lines. `tracking_confidence` is
+        # None on every frame for MediaPipe 0.10.14 because the API
+        # does not expose a separate tracking score; the panel shows
+        # the explanatory note via `_format_tracking_confidence`.
+        per_hand_lines.append(f"  det_conf: {hand.confidence:.3f}")
+        per_hand_lines.append(f"  trk_conf: {_format_tracking_confidence(hand)}")
+        # Per-hand diagnostic status (accepted / retained / filtered
+        # / discarded) and discard reason when present.
+        per_hand_lines.append(f"  status:    {_format_status(hand)}")
         per_hand_lines.append(f"  gesture_eligible: {hand.gesture_eligible}")
         per_hand_lines.append(f"  is_retained: {hand.is_retained}")
         per_hand_lines.append(f"  scale: {_format_scale(hand)}")

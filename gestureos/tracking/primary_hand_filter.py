@@ -25,6 +25,11 @@ from dataclasses import replace
 from typing import Iterable
 
 from models.data_models import HandData
+from tracking.hand_detector import (
+    REASON_DOMINANT_HAND_MODE,
+    STATUS_ACCEPTED,
+    STATUS_FILTERED,
+)
 
 
 logger = logging.getLogger('gestureos')
@@ -108,10 +113,27 @@ class PrimaryHandFilter:
         if mode == MODE_OFF:
             # All hands eligible. Still replace() to produce fresh
             # dataclass instances (immutability discipline).
-            return [replace(h, gesture_eligible=True) for h in hands]
+            return [replace(h, gesture_eligible=True, status=STATUS_ACCEPTED) for h in hands]
 
         target = CHIRALITY_LEFT if mode == MODE_LEFT else CHIRALITY_RIGHT
         return [
-            replace(h, gesture_eligible=(h.chirality == target))
+            replace(
+                h,
+                gesture_eligible=(h.chirality == target),
+                # CP-4 Tracking Stabilization: tag the hand so the
+                # Developer Mode debug panel can render the filter
+                # state per hand. Hands whose chirality is `None`
+                # (the handedness-missing path) are NOT promoted
+                # to primary and are tagged 'filtered' with the
+                # standard reason.
+                status=(
+                    STATUS_ACCEPTED if h.chirality == target
+                    else STATUS_FILTERED
+                ),
+                status_reason=(
+                    None if h.chirality == target
+                    else REASON_DOMINANT_HAND_MODE
+                ),
+            )
             for h in hands
         ]

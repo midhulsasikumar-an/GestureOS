@@ -14,6 +14,7 @@ from gestures.dynamic_recognizer import (
     SWIPE_HORIZONTAL_DX_THRESHOLD_HAND_SCALES,
     SWIPE_VERTICAL_DY_THRESHOLD_HAND_SCALES,
     WAVE_MIN_REVERSALS,
+    WAVE_MIN_TOTAL_AMPLITUDE_HAND_SCALES,
     detect_circular_motion,
     detect_swipe_down,
     detect_swipe_left,
@@ -43,6 +44,11 @@ class TestConstants:
     def test_wave_min_reversals_pinned(self) -> None:
         # PRD §4.4 Wave rule: "≥2 direction reversals".
         assert WAVE_MIN_REVERSALS == 2
+
+    def test_wave_min_amplitude_pinned(self) -> None:
+        # ≥1.0 hand-scales peak-to-peak x-amplitude required to
+        # distinguish deliberate Wave from camera-noise jitter.
+        assert WAVE_MIN_TOTAL_AMPLITUDE_HAND_SCALES == 1.0
 
 
 # ======================================================================
@@ -180,6 +186,30 @@ class TestWave:
     def test_wave_rejected_with_insufficient_buffer(self) -> None:
         buf = [(0.30, 0.50, 0), (0.40, 0.50, 33)]
         assert detect_wave(buf, hand_scale=0.10) is None
+
+    def test_wave_rejected_for_low_amplitude(self) -> None:
+        # Small zigzag with ≥2 reversals but only 0.01 raw amplitude,
+        # which is 0.1 hand-scales at hand_scale=0.10 — well below
+        # the 1.0 hand-scale threshold. Must be rejected even though
+        # the reversal count is sufficient.
+        buf = [
+            (0.50, 0.50, 0),
+            (0.51, 0.50, 33),
+            (0.50, 0.50, 66),
+            (0.51, 0.50, 100),
+            (0.50, 0.50, 133),
+        ]
+        assert detect_wave(buf, hand_scale=0.10) is None
+
+    def test_wave_rejected_for_low_amplitude_without_hand_scale(self) -> None:
+        # When hand_scale is 0.0 the amplitude check returns None
+        # (cannot verify the amplitude is meaningful).
+        buf = [
+            (0.30, 0.50, 0),
+            (0.50, 0.50, 33),
+            (0.30, 0.50, 66),
+        ]
+        assert detect_wave(buf, hand_scale=0.0) is None
 
 
 # ======================================================================

@@ -29,6 +29,7 @@ from dataclasses import replace
 from typing import Iterable
 
 from models.data_models import HandData
+from tracking.hand_detector import REASON_OCCLUSION_BRIDGE, STATUS_RETAINED
 
 
 logger = logging.getLogger('gestureos')
@@ -158,7 +159,18 @@ class OcclusionHandler:
         for role in list(self._retained):
             data, lost_at = self._retained[role]
             if now - lost_at <= self.retention_s:
-                bridged = replace(data, is_retained=True)
+                # CP-4 Tracking Stabilization: mark the bridged copy
+                # as 'retained' with reason 'occlusion_bridge' so the
+                # Developer Mode debug panel can show the source of
+                # the hand on every frame. The retained copy is a
+                # distinct HandData (via `replace`); the input
+                # `current_hands` list is not mutated.
+                bridged = replace(
+                    data,
+                    is_retained=True,
+                    status=STATUS_RETAINED,
+                    status_reason=REASON_OCCLUSION_BRIDGE,
+                )
                 result.append(bridged)
                 # Optional DEBUG: log the bridge event the first time we
                 # emit a retained hand, to keep log volume low.

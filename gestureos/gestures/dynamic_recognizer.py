@@ -86,6 +86,16 @@ SWIPE_MIN_VELOCITY_HAND_SCALES_PER_MS: float = 0.003
 #: the buffer window (PRD §4.4 Wave rule: "≥2 direction reversals").
 WAVE_MIN_REVERSALS: int = 2
 
+#: Minimum peak-to-peak x-amplitude in hand-scale-normalized units
+#: for a Wave to be accepted. This distinguishes a deliberate
+#: side-to-side hand motion from small-amplitude jitter (e.g.,
+#: camera noise, minor hand tremor) that could otherwise produce
+#: ≥2 reversals in a short window. 1.0 hand-scales is generous
+#: enough that the canonical wave_right fixture (whose x spans
+#: 0.30–0.70, hand_scale=0.10 → 4.0 hand-scales) passes comfortably,
+#: and tight enough that sub-centimeter jitter is rejected.
+WAVE_MIN_TOTAL_AMPLITUDE_HAND_SCALES: float = 1.0
+
 #: Circular motion requires angular progression of at least this many
 #: degrees around the bounding-box centroid within the buffer window
 #: (PRD §4.4 Circular Motion rule: "≥ 270°").
@@ -477,7 +487,8 @@ def detect_wave(
     hand_scale: float,
 ) -> GestureResult | None:
     """Recognize a Wave motion: ≥2 direction reversals in normalized
-    x-displacement within the buffer window (PRD §4.4 Wave rule).
+    x-displacement within the buffer window (PRD §4.4 Wave rule) AND
+    a minimum peak-to-peak amplitude of 1.0 hand-scales.
 
     Implements PRD §4.4 (Wave rule). Default action: Show Desktop.
 
@@ -490,20 +501,31 @@ def detect_wave(
     > resolution; the disambiguation is deferred to product-owner
     > review.
 
-    Signals used: count of x-direction reversals across consecutive
-    buffer samples (Priority 4) + trajectory shape (Priority 4, the
-    ≥2-reversal criterion IS the trajectory shape). Two independent
-    signals per PRD FR-MS-02 (note: Wave is a single-rule trajectory
-    shape and the reversal-count is the second signal within the
-    same trajectory; this is consistent with the PRD's "≥2
-    direction reversals" wording, which itself implies a shape
-    constraint, not just a count).
+    Signals used (three independent signals per PRD FR-MS-02):
+      - count of x-direction reversals (Priority 4, motion-history
+        shape): at least 2 changes in sign of consecutive dx.
+      - peak-to-peak x-amplitude (Priority 4, motion-history shape):
+        the total x-range of the buffer, normalized by hand_scale,
+        must be at least 1.0 hand-scales. This rejects small jitter
+        that could produce ≥2 reversals.
+      - trajectory shape (Priority 4): the ≥2-reversal criterion IS
+        a shape constraint, not just a count.
     """
     if len(buffer) < 3:
         return None
 
     reversals = _count_x_reversals(buffer)
     if reversals < WAVE_MIN_REVERSALS:
+        return None
+
+    # Priority 4: peak-to-peak x-amplitude normalized by hand_scale.
+    # This rejects low-amplitude jitter (camera noise, hand tremor)
+    # that could otherwise produce ≥2 reversals.
+    if hand_scale <= 0.0:
+        return None
+    xs = [p[0] for p in buffer]
+    x_range_norm = (max(xs) - min(xs)) / hand_scale
+    if x_range_norm < WAVE_MIN_TOTAL_AMPLITUDE_HAND_SCALES:
         return None
 
     return GestureResult(

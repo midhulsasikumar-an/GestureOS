@@ -11,19 +11,30 @@ HandScaleEstimator, PrimaryHandFilter respectively, per Implementation Plan §6)
 RULES §2.4: tracking/ does not import from recognizer, conflict_resolver,
 or executor.
 
-Tracking-quality tuning notes (manual validation, CP-1):
-  - ``model_complexity`` defaults to 0 for ≤2 hands. MediaPipe's
-    higher-complexity model (1) is intended for >2 hands and adds
-    noticeable latency without accuracy benefit at our hand count.
-  - ``min_tracking_confidence`` is lowered to 0.4 (vs MediaPipe's
-    default 0.5) so the tracker keeps a hand through moderate
-    rotation / partial finger closure instead of dropping it and
-    forcing a full re-detection pass.
+Tracking-quality tuning notes:
+  - ``model_complexity`` is set to 1. This is the heavier MediaPipe
+    Hands graph; at ≤2 hands and 1280×720 it absorbs the additional
+    CPU cost and retains tracking more reliably through partial
+    occlusion and wrist rotation. The CP-1 setting of 0 was
+    intentional for latency, but the per-hand accuracy gain from 1
+    outweighs the per-frame cost on the reference hardware (CP-4
+    Tracking Stabilization pass).
+  - ``min_tracking_confidence`` is 0.4 (vs MediaPipe's default 0.5)
+    so the tracker keeps a hand through moderate rotation / partial
+    finger closure instead of dropping it and forcing a full
+    re-detection pass.
   - ``min_detection_confidence`` stays at 0.5 — too low and we accept
     false-positive hands; too high and we miss hands at frame edges.
   - Re-init threshold bumped from 3 to 5 consecutive exceptions.
     Brief driver-level stalls should not force a MediaPipe rebuild;
     only persistent failures trigger the recovery path.
+  - Handedness-mismatch path (CP-4): when MediaPipe returns valid
+    landmarks but no/insufficient handedness metadata, the previous
+    implementation discarded the entire frame's detections. We now
+    emit each hand with ``chirality=None`` and a ``discarded``
+    status flag so the operator can see the cause. Downstream
+    stages (HandIdentityModule, OcclusionHandler, HandScaleEstimator,
+    PrimaryHandFilter) all already tolerate ``chirality=None``.
 """
 
 from __future__ import annotations
@@ -44,8 +55,13 @@ logger = logging.getLogger('gestureos')
 # ---------------------------------------------------------------------------
 
 MAX_NUM_HANDS: int = 2
-# 0 = fast path for ≤2 hands (recommended); 1 = heavier model for ≥3 hands.
-MODEL_COMPLEXITY: int = 0
+# 1 = heavier, more accurate graph. At ≤2 hands and 1280×720 the
+# additional CPU cost is acceptable and the per-hand tracking
+# reliability gain (under partial occlusion / wrist rotation) is
+# worth it. The MediaPipe-documented default is also 1; CP-1 had
+# overridden this to 0 for latency. CP-4 Tracking Stabilization
+# restored the default.
+MODEL_COMPLEXITY: int = 1
 MIN_DETECTION_CONFIDENCE: float = 0.5
 # Lower than MediaPipe's default (0.5) to keep tracking through rotation.
 MIN_TRACKING_CONFIDENCE: float = 0.4
@@ -54,6 +70,21 @@ LANDMARKS_PER_HAND: int = 21
 # Five frames at 30 FPS is ~167 ms of "missing", which is enough to
 # distinguish a real stall from a transient driver glitch.
 REINIT_AFTER_CONSECUTIVE_ERRORS: int = 5
+
+# Status enum values used on `HandData.status` (CP-4 Tracking Stabilization).
+# Kept here as the canonical source of truth; the debug panel and
+# tracking tests import these constants.
+STATUS_ACCEPTED: str = 'accepted'
+STATUS_RETAINED: str = 'retained'
+STATUS_FILTERED: str = 'filtered'
+STATUS_DISCARDED: str = 'discarded'
+
+# Status reason strings for diagnostic logs and the Developer Mode panel.
+# Reason is `None` for 'accepted' hands.
+REASON_HANDEDNESS_MISSING: str = 'handedness_missing'
+REASON_MALFORMED_LANDMARKS: str = 'malformed_landmarks'
+REASON_DOMINANT_HAND_MODE: str = 'dominant_hand_mode'
+REASON_OCCLUSION_BRIDGE: str = 'occlusion_bridge'
 
 
 class TrackingInitError(Exception):
@@ -176,48 +207,154 @@ class TrackingModule:
                     )
             return []
 
-        if results.multi_hand_landmarks is None or results.multi_handedness is None:
+        if results.multi_hand_landmarks is None:
             return []
 
-        if len(results.multi_hand_landmarks) != len(results.multi_handedness):
-            # MediaPipe gave us mismatched counts — discard this frame's detections
+        # CP-4 Tracking Stabilization: when handedness metadata is
+        # missing or has a different count than the landmarks list,
+        # we DO NOT drop the entire frame. Instead we iterate the
+        # landmarks list and emit each hand with chirality=None and
+        # confidence=0.0; downstream stages (HandIdentityModule,
+        # OcclusionHandler, HandScaleEstimator, PrimaryHandFilter)
+        # all tolerate chirality=None. The event is logged at WARN
+        # level so future debug can attribute the loss.
+        handedness_list = results.multi_handedness
+        if handedness_list is None:
+            logger.warning(
+                'tracking',
+                extra={'extras': {
+                    'event': 'mediapipe_hand_count_mismatch',
+                    'reason': REASON_HANDEDNESS_MISSING,
+                    'landmarks_count': len(results.multi_hand_landmarks),
+                    'handedness_count': 0,
+                }},
+            )
+            return [
+                self._build_handdata(
+                    hand_landmarks=lm,
+                    handedness_classification=None,
+                    discarded=REASON_HANDEDNESS_MISSING,
+                )
+                for lm in results.multi_hand_landmarks
+            ]
+
+        if len(results.multi_hand_landmarks) != len(handedness_list):
+            # Mismatch — emit the landmark-bearing hands with
+            # chirality=None for any index past the shorter list. The
+            # shorter list dictates how many we have full metadata for.
             logger.warning(
                 'tracking',
                 extra={'extras': {
                     'event': 'mediapipe_hand_count_mismatch',
                     'landmarks_count': len(results.multi_hand_landmarks),
-                    'handedness_count': len(results.multi_handedness),
+                    'handedness_count': len(handedness_list),
                 }},
             )
-            return []
+            out: list[HandData] = []
+            n = min(len(results.multi_hand_landmarks), len(handedness_list))
+            for i in range(n):
+                out.append(
+                    self._build_handdata(
+                        hand_landmarks=results.multi_hand_landmarks[i],
+                        handedness_classification=(
+                            handedness_list[i].classification[0]
+                        ),
+                        discarded=None,
+                    )
+                )
+            # Any landmarks past the shorter list are emitted with
+            # chirality=None.
+            for i in range(n, len(results.multi_hand_landmarks)):
+                out.append(
+                    self._build_handdata(
+                        hand_landmarks=results.multi_hand_landmarks[i],
+                        handedness_classification=None,
+                        discarded=REASON_HANDEDNESS_MISSING,
+                    )
+                )
+            return out
 
         out: list[HandData] = []
         for hand_landmarks, handedness in zip(
-            results.multi_hand_landmarks, results.multi_handedness
+            results.multi_hand_landmarks, handedness_list
         ):
-            # Defensive: discard malformed hands
-            if len(hand_landmarks.landmark) != LANDMARKS_PER_HAND:
-                logger.warning(
-                    'tracking',
-                    extra={'extras': {
-                        'event': 'malformed_hand_discarded',
-                        'landmark_count': len(hand_landmarks.landmark),
-                    }},
-                )
-                continue
-
-            landmarks: list[tuple[float, float, float]] = [
-                (lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark
-            ]
-            chirality = handedness.classification[0].label  # 'Left' or 'Right'
-            confidence = float(handedness.classification[0].score)
-
             out.append(
-                HandData(
-                    landmarks=landmarks,
-                    chirality=chirality,
-                    confidence=confidence,
+                self._build_handdata(
+                    hand_landmarks=hand_landmarks,
+                    handedness_classification=handedness.classification[0],
+                    discarded=None,
                 )
             )
 
         return out
+
+    def _build_handdata(
+        self,
+        hand_landmarks: Any,
+        handedness_classification: Any | None,
+        discarded: str | None,
+    ) -> HandData:
+        """Construct a HandData from one MediaPipe detection.
+
+        Encapsulates the malformed-hand defensive path and the
+        handedness-missing fallback. `discarded` is the reason
+        string (matches `REASON_HANDEDNESS_MISSING` /
+        `REASON_MALFORMED_LANDMARKS`) or `None` for a fully
+        valid hand.
+
+        CP-4: this method is the single point that populates the
+        new `status` and `status_reason` fields. Every hand that
+        leaves `detect()` has a non-empty `status` and an
+        explanatory `status_reason` when the status is not
+        `accepted`.
+        """
+        # Defensive: discard malformed hands. CP-1's `malformed_hand_discarded`
+        # log event is preserved.
+        if len(hand_landmarks.landmark) != LANDMARKS_PER_HAND:
+            logger.warning(
+                'tracking',
+                extra={'extras': {
+                    'event': 'malformed_hand_discarded',
+                    'landmark_count': len(hand_landmarks.landmark),
+                }},
+            )
+            # We still emit a HandData so the debug panel can show the
+            # status, but with empty landmarks. This matches the spirit
+            # of "don't silently drop" while not breaking the
+            # `landmarks` length invariant downstream.
+            if discarded is None:
+                discarded = REASON_MALFORMED_LANDMARKS
+            return HandData(
+                landmarks=[],
+                chirality=None,
+                confidence=0.0,
+                status=STATUS_DISCARDED,
+                status_reason=discarded,
+            )
+
+        landmarks: list[tuple[float, float, float]] = [
+            (lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark
+        ]
+        if handedness_classification is None:
+            chirality: str | None = None
+            confidence = 0.0
+        else:
+            chirality = handedness_classification.label  # 'Left' or 'Right'
+            confidence = float(handedness_classification.score)
+
+        if discarded is not None:
+            return HandData(
+                landmarks=landmarks,
+                chirality=chirality,
+                confidence=confidence,
+                status=STATUS_DISCARDED,
+                status_reason=discarded,
+            )
+
+        return HandData(
+            landmarks=landmarks,
+            chirality=chirality,
+            confidence=confidence,
+            status=STATUS_ACCEPTED,
+            status_reason=None,
+        )
