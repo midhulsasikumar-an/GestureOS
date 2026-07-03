@@ -60,6 +60,8 @@ from tracking.hand_scale import HandScaleEstimator
 from tracking.occlusion_handler import OcclusionHandler
 from tracking.primary_hand_filter import PrimaryHandFilter
 
+from diagnostics.pipeline_diagnostics import PipelineDiagnosticsCollector
+
 
 logger = logging.getLogger('gestureos')
 
@@ -160,6 +162,9 @@ class CaptureThread(QThread):
         # overlay. Built from stability/cooldown/cleared-results each
         # frame; forwarded as the 4th arg of frame_ready.
         self._latest_gesture_state: object | None = None
+        # Pipeline Diagnostics collector (observational only).
+        self._diags = PipelineDiagnosticsCollector()
+        self._frame_counter: int = 0
 
 
     # -- Pipeline introspection ------------------------------------------------
@@ -184,6 +189,23 @@ class CaptureThread(QThread):
             self._cooldown_filter is not None,
             self._activation_gate is not None,
         ])
+
+    # -- Diagnostics helpers -------------------------------------------------
+
+    @staticmethod
+    def _find_rejection_info(
+        hands: list[HandData],
+    ) -> tuple[str | None, str | None]:
+        """Scan a hand list for the first filtered/discarded hand.
+
+        Returns (status_reason, role) of the first hand whose status
+        is neither ``accepted`` nor ``retained``, or (None, None) when
+        no rejection is found.  Purely observational; no side effects.
+        """
+        for h in hands:
+            if h.status not in ('accepted', 'retained'):
+                return h.status_reason, h.role
+        return None, None
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -247,9 +269,22 @@ class CaptureThread(QThread):
                     self._rgb_buf = np.empty(frame.shape, dtype=frame.dtype)
                 cv2.cvtColor(frame, cv2.COLOR_BGR2RGB, dst=self._rgb_buf)
 
+                # Pipeline Diagnostics: begin per-frame collection.
+                self._frame_counter += 1
+                self._diags.begin_frame(self._frame_counter)
+
                 hands: list[HandData] = []
                 try:
+                    t_detect = time.monotonic()
                     hands = self._tracking.detect(self._rgb_buf)
+                    detect_ms = (time.monotonic() - t_detect) * 1000
+                    reject_reason, reject_role = self._find_rejection_info(hands)
+                    self._diags.record_stage(
+                        "TrackingModule.detect", [],
+                        hands, detect_ms,
+                        rejection_reason=reject_reason,
+                        rejected_hand_role=reject_role,
+                    )
                 except TrackingInitError as exc:
                     self.tracking_error.emit(str(exc))
                     break
@@ -292,6 +327,35 @@ class CaptureThread(QThread):
                 # so CP-5 consumers can rely on the signal firing
                 # every frame. Empty list == "no gesture this frame".
                 self.gesture_detected.emit(cleared_results)
+
+                # Pipeline Diagnostics: structured DEBUG logging.
+                diags = self._diags.frame_diagnostics
+                if diags.stages:
+                    for snap in diags.stages.values():
+                        logger.debug(
+                            'pipeline_stage',
+                            extra={'extras': {
+                                'frame': diags.frame_number,
+                                'stage': snap.stage_name,
+                                'input': snap.input_hand_count,
+                                'output': snap.output_hand_count,
+                                'time_ms': snap.processing_time_ms,
+                                'rejection_reason': snap.rejection_reason,
+                                'rejected_role': snap.rejected_hand_role,
+                                'first_fail': diags.first_failing_stage,
+                            }},
+                        )
+                    if diags.latest_rejection:
+                        ev = diags.latest_rejection
+                        logger.debug(
+                            'pipeline_rejection',
+                            extra={'extras': {
+                                'frame': ev.frame_number,
+                                'stage': ev.stage_name,
+                                'reason': ev.reason,
+                                'hand_role': ev.hand_role,
+                            }},
+                        )
 
                 # Throttled status log — once per ~1s
                 if t0 - last_log_ts >= 1.0:
@@ -369,10 +433,39 @@ class CaptureThread(QThread):
         # → PrimaryHandFilter. Always runs (even when INACTIVE) so
         # the overlay receives hands WITH scale and role populated.
         try:
+            t0 = time.monotonic()
             identified = self._hand_identity.assign_roles(hands, now)
+            self._diags.record_stage(
+                "HandIdentityModule.assign_roles",
+                hands, identified,
+                (time.monotonic() - t0) * 1000,
+            )
+
+            t0 = time.monotonic()
             bridged = self._occlusion_handler.bridge_gaps(identified, now)
+            self._diags.record_stage(
+                "OcclusionHandler.bridge_gaps",
+                identified, bridged,
+                (time.monotonic() - t0) * 1000,
+            )
+
+            t0 = time.monotonic()
             scaled = [self._scale_estimator.estimate(h) for h in bridged]
+            self._diags.record_stage(
+                "HandScaleEstimator",
+                bridged, scaled,
+                (time.monotonic() - t0) * 1000,
+            )
+
+            t0 = time.monotonic()
             filtered = self._primary_hand_filter.filter(scaled)
+            pf_ms = (time.monotonic() - t0) * 1000
+            reject_reason, reject_role = self._find_rejection_info(filtered)
+            self._diags.record_stage(
+                "PrimaryHandFilter", scaled, filtered, pf_ms,
+                rejection_reason=reject_reason,
+                rejected_hand_role=reject_role,
+            )
         except Exception as exc:  # noqa: BLE001 — defensive; per-component guards already exist
             logger.error(
                 'capture_thread',
@@ -421,9 +514,29 @@ class CaptureThread(QThread):
         # action dispatch without blocking the recognition needed
         # for the hold-timer to work.
         try:
+            t0 = time.monotonic()
             self._gesture_engine.update_motion_history(filtered, now)
+            self._diags.record_stage(
+                "GestureEngine.update_motion_history",
+                filtered, filtered,
+                (time.monotonic() - t0) * 1000,
+            )
+
+            t0 = time.monotonic()
             candidates = self._gesture_engine.evaluate(filtered, now)
+            self._diags.record_stage(
+                "GestureEngine.evaluate",
+                filtered, candidates,
+                (time.monotonic() - t0) * 1000,
+            )
+
+            t0 = time.monotonic()
             winners = self._conflict_resolver.resolve(candidates)
+            self._diags.record_stage(
+                "ConflictResolver.resolve",
+                candidates, winners,
+                (time.monotonic() - t0) * 1000,
+            )
 
             # Feed the gate from every conflict-resolved winner
             # (pre-stability, pre-cooldown). The gate must see every
@@ -431,19 +544,43 @@ class CaptureThread(QThread):
             for winner in winners:
                 self._activation_gate.feed_gesture(winner.gesture_name, now)
 
-            # Apply StabilityFilter + CooldownFilter per winner to
-            # produce the dispatch-ready `cleared_results` list.
+            # Apply StabilityFilter per winner.
             self._cleared_results.clear()
+            stable_results: list[GestureResult] = []
+            t0 = time.monotonic()
             for winner in winners:
                 stable = self._stability_filter.check(
                     winner.hand_role, winner, now
                 )
                 if stable is None:
                     continue
+                stable_results.append(stable)
+            st_ms = (time.monotonic() - t0) * 1000
+            reject_reason_st = (
+                None if len(stable_results) == len(winners)
+                else "stability_hold_timer"
+            )
+            self._diags.record_stage(
+                "StabilityFilter", winners, stable_results, st_ms,
+                rejection_reason=reject_reason_st,
+            )
+
+            # Apply CooldownFilter per stable result.
+            t0 = time.monotonic()
+            for stable in stable_results:
                 cleared = self._cooldown_filter.check(stable, now)
                 if cleared is None:
                     continue
                 self._cleared_results.append(cleared)
+            cd_ms = (time.monotonic() - t0) * 1000
+            reject_reason_cd = (
+                None if len(self._cleared_results) == len(stable_results)
+                else "cooldown_active"
+            )
+            self._diags.record_stage(
+                "CooldownFilter", stable_results, self._cleared_results, cd_ms,
+                rejection_reason=reject_reason_cd,
+            )
 
             # Rebuild the gesture state with the richer CP-3/CP-4 data
             # (candidates, winners, stability, cooldown status).
@@ -468,6 +605,11 @@ class CaptureThread(QThread):
         # frames and toggle itself to ACTIVE on hold-timer satisfaction.
         if self._activation_gate.state != TrackingState.ACTIVE:
             self._cleared_results.clear()
+            self._diags.record_rejection(
+                "ActivationGate",
+                reason="gate_inactive",
+                hand_role=None,
+            )
 
         return self._cleared_results
 
@@ -557,4 +699,5 @@ class CaptureThread(QThread):
                 if self._activation_gate is not None
                 else 'INACTIVE'
             ),
+            pipeline_diagnostics=self._diags.frame_diagnostics,
         )

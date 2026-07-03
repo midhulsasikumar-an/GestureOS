@@ -77,6 +77,7 @@ from gestures.gesture_utils import (
     finger_states,
 )
 from models.data_models import HandData, HandScale
+from diagnostics.pipeline_diagnostics import FrameDiagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +443,44 @@ def render_debug_panel(
         if i != len(hands_list) - 1:
             per_hand_lines.append("")
 
+    # Section 3: Pipeline Diagnostics (observational only).
+    diags: FrameDiagnostics | None = None
+    if gesture_state is not None:
+        raw = getattr(gesture_state, 'pipeline_diagnostics', None)
+        if raw is not None:
+            diags = raw
+    pipeline_lines: list[str] = []
+    if diags is not None and diags.stages:
+        pipeline_lines.append("== PIPELINE DIAGNOSTICS ==")
+        pipeline_lines.append(f"Frame: {diags.frame_number}")
+        first_fail = diags.first_failing_stage
+        pipeline_lines.append(
+            f"First Fail: {first_fail}" if first_fail else "First Fail: (none)"
+        )
+        last_rej = diags.latest_rejection
+        if last_rej is not None:
+            pipeline_lines.append(
+                f"Last Reject: {last_rej.reason} @ {last_rej.stage_name}"
+            )
+        pipeline_lines.append("")
+        for snap in diags.stages.values():
+            arrow = f"{snap.input_hand_count} -> {snap.output_hand_count}"
+            rejection_tag = ""
+            if snap.rejection_reason is not None:
+                rejection_tag = f" [{snap.rejection_reason}]"
+            pipeline_lines.append(
+                f"{snap.stage_name:45s} {arrow:>8s}  "
+                f"{snap.processing_time_ms:6.1f}ms{rejection_tag}"
+            )
+
     # Wrap long lines to fit the panel width.
     all_lines = _wrap_lines(general_lines, max_panel_width_px)
     if per_hand_lines:
         all_lines.append("")  # gap between General and Per-Hand sections
         all_lines.extend(_wrap_lines(per_hand_lines, max_panel_width_px))
+    if pipeline_lines:
+        all_lines.append("")  # gap between Per-Hand and Pipeline sections
+        all_lines.extend(_wrap_lines(pipeline_lines, max_panel_width_px))
 
     # Compute panel bounding box.
     line_count = max(len(all_lines), 1)
