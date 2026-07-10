@@ -83,6 +83,7 @@ class GestureResult:
     is_dynamic: bool
     hand_role: str
     timestamp: float
+    source: str = 'unknown'  # 'mediapipe' | 'custom_fallback' | 'dynamic_engine' (V2)
 
 
 # ---------------------------------------------------------------------------

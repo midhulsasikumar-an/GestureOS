@@ -1,13 +1,12 @@
 """End-to-end pipeline test for Checkpoint 3.
 
 Exercises the full per-frame pipeline:
-    HandData -> GestureEngine.evaluate -> ConflictResolver.resolve
-              -> StabilityFilter.check -> CooldownFilter.check
+    HandData -> StaticGestureEngine.evaluate -> GestureFuser.resolve
+              -> GestureGate.process
 
-Verifies the per-stage contracts line up: GestureEngine returns
-`list[GestureResult]`, ConflictResolver consumes that exact shape,
-StabilityFilter accepts the resolver's output, CooldownFilter
-accepts the stability-passed output.
+Verifies the per-stage contracts line up: StaticGestureEngine returns
+`list[GestureResult]`, GestureFuser consumes that exact shape,
+GestureGate accepts the fuser's output.
 
 This is a UNIT-level integration test (no live camera), per AI
 Dev Guide §9.2's distinction: a true integration test (with mocked
@@ -20,10 +19,9 @@ from __future__ import annotations
 
 import pytest
 
-from gestures.conflict_resolver import ConflictResolver
-from gestures.cooldown_filter import CooldownFilter
-from gestures.gesture_engine import GestureEngine
-from gestures.stability_filter import StabilityFilter
+from gestures.gesture_fuser import GestureFuser
+from gestures.gesture_gate import GestureGate
+from gestures.static_gesture_engine import StaticGestureEngine
 from models.data_models import GestureResult
 from settings.settings_manager import Settings
 
@@ -43,16 +41,14 @@ def make_settings(**overrides) -> Settings:
 
 
 class TestPipelineComposition:
-    """Verify the GestureEngine -> ConflictResolver -> Stability ->
-    Cooldown chain produces a single, de-noised gesture result per
-    hand role."""
+    """Verify the StaticGestureEngine -> GestureFuser -> GestureGate
+    chain produces a single, de-noised gesture result per hand role."""
 
     def test_single_hand_static_gesture_full_chain(self) -> None:
         settings = make_settings()
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         # Update motion history (required for engine.evaluate to read it)
@@ -68,13 +64,9 @@ class TestPipelineComposition:
         for _ in range(8):  # ~264 ms
             now_ms += 33
             candidates = engine.evaluate([hand], now=now_ms / 1000.0)
-            winners = resolver.resolve(candidates)
-            for w in winners:
-                stable = stability.check(w.hand_role, w, now=now_ms / 1000.0)
-                if stable is not None:
-                    out = cooldown.check(stable, now=now_ms / 1000.0)
-                    if out is not None:
-                        last_emitted.append(out)
+            winners = fuser.resolve(candidates)
+            out_list = gate.process(winners, now=now_ms / 1000.0)
+            last_emitted.extend(out_list)
 
         # We expect at least one emit (open_palm held for >100 ms).
         assert any(e.gesture_name == 'open_palm' for e in last_emitted), (
@@ -83,26 +75,24 @@ class TestPipelineComposition:
 
     def test_no_hands_emits_nothing(self) -> None:
         settings = make_settings()
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         candidates = engine.evaluate([], now=0.0)
         assert candidates == []
-        winners = resolver.resolve(candidates)
+        winners = fuser.resolve(candidates)
         assert winners == []
-        # Stability: no candidate -> None (resets state).
-        assert stability.check('HAND_A', None, now=0.0) is None
+        # Gate: no winners -> empty list.
+        assert gate.process([], now=0.0) == []
 
     def test_two_hands_two_results(self) -> None:
         """Two-hand scenario: HAND_A does Open Palm, HAND_B does
         Peace Sign; both must eventually emit independently."""
         settings = make_settings()
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         hand_a = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         hand_b = make_hand_with_scale(pose_name='peace_sign_right', role='HAND_B')
@@ -115,16 +105,13 @@ class TestPipelineComposition:
             now = (i + 1) * 33 / 1000.0
             engine.update_motion_history([hand_a, hand_b], now=now)
             candidates = engine.evaluate([hand_a, hand_b], now=now)
-            winners = resolver.resolve(candidates)
-            for w in winners:
-                stable = stability.check(w.hand_role, w, now=now)
-                if stable is not None:
-                    out = cooldown.check(stable, now=now)
-                    if out is not None:
-                        if out.hand_role == 'HAND_A':
-                            emitted_a.append(out.gesture_name)
-                        elif out.hand_role == 'HAND_B':
-                            emitted_b.append(out.gesture_name)
+            winners = fuser.resolve(candidates)
+            out_list = gate.process(winners, now=now)
+            for out in out_list:
+                if out.hand_role == 'HAND_A':
+                    emitted_a.append(out.gesture_name)
+                elif out.hand_role == 'HAND_B':
+                    emitted_b.append(out.gesture_name)
 
         assert 'open_palm' in emitted_a, (
             f'Hand A never emitted open_palm; emitted={emitted_a}'
@@ -138,10 +125,9 @@ class TestPipelineComposition:
         same-(role, gesture_name) trigger within the cooldown window
         is suppressed."""
         settings = make_settings(gesture_stability_window_ms=50)
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         emit_count = 0
@@ -150,13 +136,9 @@ class TestPipelineComposition:
             now = i * 33 / 1000.0
             engine.update_motion_history([hand], now=now)
             candidates = engine.evaluate([hand], now=now)
-            winners = resolver.resolve(candidates)
-            for w in winners:
-                stable = stability.check(w.hand_role, w, now=now)
-                if stable is not None:
-                    out = cooldown.check(stable, now=now)
-                    if out is not None:
-                        emit_count += 1
+            winners = fuser.resolve(candidates)
+            out_list = gate.process(winners, now=now)
+            emit_count += len(out_list)
 
         # The cooldown is 500 ms, so within 660 ms we expect at most
         # 2 emissions (first at t~50ms, second at t~550ms which is just
@@ -171,14 +153,14 @@ class TestPipelineComposition:
     def test_multiple_candidates_per_role_resolved_to_one(self) -> None:
         """A transitional pose that satisfies BOTH Open Palm and
         Peace Sign finger-state requirements should produce two
-        candidates, with ConflictResolver picking the higher-confidence
+        candidates, with GestureFuser picking the higher-confidence
         winner.
 
         (Note: this is a contrived test — no real pose satisfies both
         patterns simultaneously. We construct a synthetic hand whose
         landmarks are an Open Palm fixture but whose chirality label
         is set so is_thumb_extended returns True with extended fingers,
-        then verify that ConflictResolver runs and returns at most one
+        then verify that GestureFuser runs and returns at most one
         winner per role.)
         """
         # Use window_ms=1 (smallest allowed by StabilityFilter) to
@@ -187,21 +169,20 @@ class TestPipelineComposition:
         # Stability = 0 ms: every frame emits immediately. (Used to
         # exercise the conflict resolver + cooldown chain without
         # holding the gesture for 100 ms.)
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         engine.update_motion_history([hand], now=0.0)
         candidates = engine.evaluate([hand], now=0.0)
 
-        # Even if multiple candidates were produced, the resolver
+        # Even if multiple candidates were produced, the fuser
         # must return at most ONE per role.
-        winners = resolver.resolve(candidates)
+        winners = fuser.resolve(candidates)
         hand_a_winners = [w for w in winners if w.hand_role == 'HAND_A']
         assert len(hand_a_winners) <= 1, (
-            f'ConflictResolver returned {len(hand_a_winners)} winners for HAND_A; expected ≤ 1'
+            f'GestureFuser returned {len(hand_a_winners)} winners for HAND_A; expected ≤ 1'
         )
 
 
@@ -211,23 +192,17 @@ class TestHotPathNeverRaises:
 
     def test_pipeline_handles_malformed_hands_gracefully(self) -> None:
         settings = make_settings()
-        engine = GestureEngine(settings)
-        resolver = ConflictResolver()
-        stability = StabilityFilter(settings.gesture_stability_window_ms)
-        cooldown = CooldownFilter(settings)
+        engine = StaticGestureEngine(settings)
+        fuser = GestureFuser()
+        gate = GestureGate(settings, stability_window_ms=settings.gesture_stability_window_ms)
 
         from dataclasses import replace
-        # Empty landmarks list — TrackingModule would discard this in
-        # real flow, but the recognizers must still not raise.
         bad_hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         bad_hand = replace(bad_hand, landmarks=[], scale=None)
 
         # Each stage must not raise.
         engine.update_motion_history([bad_hand], now=0.0)
         candidates = engine.evaluate([bad_hand], now=0.0)
-        winners = resolver.resolve(candidates)
-        for w in winners:
-            stability.check(w.hand_role, w, now=0.0)
-            # Cooldown is only called with stability-passed results,
-            # so we skip it here for unfiltered inputs.
+        winners = fuser.resolve(candidates)
+        gate.process(winners, now=0.0)
         # No exception was raised — passes.

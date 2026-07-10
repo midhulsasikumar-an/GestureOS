@@ -62,6 +62,14 @@ class Settings:
     active_profile: str = 'productivity'
     show_overlay: bool = True
     developer_mode: bool = False
+    # ---- ML model ----
+    # TRD §8.1 / §8.2: relative or absolute path to the bundled
+    # MediaPipe Gesture Recognizer model file. The default points to
+    # the V1 bundled model under `gestureos/assets/models/`. Tests
+    # and advanced users may override this to point at a different
+    # .task file. RULES §3.5: model paths live in the Settings
+    # dataclass and are consumed only via ModelManager.
+    ml_model_path: str = 'models/gesture_recognizer.task'
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +95,7 @@ _FIELD_VALIDATORS: dict[str, tuple[type, Any]] = {
     'active_profile': (str, 'productivity'),
     'show_overlay': (bool, True),
     'developer_mode': (bool, False),
+    'ml_model_path': (str, 'models/gesture_recognizer.task'),
 }
 
 # Constrained string domains (TRD §7.1)
@@ -95,6 +104,13 @@ _DOMINANT_HAND_MODES = ('off', 'left', 'right')
 
 _FLOAT_RANGES: dict[str, tuple[float, float]] = {
     'gesture_confidence_threshold': (0.50, 0.99),
+}
+
+# Field-specific string validation (non-empty, etc.)
+_STRING_VALIDATION: dict[str, dict[str, Any]] = {
+    'ml_model_path': {
+        'min_length': 1,
+    },
 }
 
 _INT_RANGES: dict[str, tuple[int, int]] = {
@@ -138,6 +154,13 @@ def _validate_field(name: str, value: Any) -> Any:
     if name in _INT_RANGES:
         lo, hi = _INT_RANGES[name]
         if not (lo <= value <= hi):
+            return default
+
+    # String validation (min_length, etc.)
+    str_rules = _STRING_VALIDATION.get(name)
+    if str_rules is not None:
+        min_length = str_rules.get('min_length')
+        if min_length is not None and len(value) < min_length:
             return default
 
     return value

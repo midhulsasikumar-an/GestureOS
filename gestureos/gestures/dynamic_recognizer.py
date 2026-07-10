@@ -40,7 +40,7 @@ import math
 import time
 from typing import Iterable, Sequence
 
-from gestures.motion_history import MotionHistoryBuffer
+from gestures.motion_history_service import MotionHistoryService
 from models.data_models import GestureResult
 
 

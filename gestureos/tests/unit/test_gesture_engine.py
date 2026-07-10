@@ -1,6 +1,6 @@
-"""Unit tests for GestureEngine — CP-3.
+"""Unit tests for StaticGestureEngine — CP-3.
 
-Per TRD §3.9: GestureEngine evaluates every registered rule and
+Per TRD §3.9: StaticGestureEngine evaluates every registered rule and
 returns ALL qualifying candidates per hand per frame (no implicit
 first-match-wins ordering, per PRD §4.6).
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from gestures.dynamic_recognizer import DYNAMIC_GESTURE_RULES
-from gestures.gesture_engine import GestureEngine
+from gestures.static_gesture_engine import StaticGestureEngine
 from gestures.static_recognizer import STATIC_GESTURE_RULES
 from models.data_models import GestureResult, HandData
 from settings.settings_manager import Settings
@@ -41,9 +41,8 @@ def make_settings(**overrides) -> Settings:
 class TestEngineConstruction:
     def test_engine_constructs_with_motion_history_buffer(self) -> None:
         settings = make_settings(motion_history_frames=25)
-        engine = GestureEngine(settings)
-        # Pre-allocated for HAND_A and HAND_B (per CP-2's
-        # MotionHistoryBuffer implementation).
+        engine = StaticGestureEngine(settings)
+        # Pre-allocated for HAND_A and HAND_B.
         assert engine.motion_history.max_frames == 25
         assert 'HAND_A' in engine.motion_history.roles()
         assert 'HAND_B' in engine.motion_history.roles()
@@ -103,12 +102,12 @@ class TestDynamicRuleRegistry:
 
 class TestEvaluate:
     def test_empty_hands_returns_empty_candidates(self) -> None:
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         result = engine.evaluate([], now=0.0)
         assert result == []
 
     def test_single_open_palm_emits_single_candidate(self) -> None:
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         engine.update_motion_history([hand], now=0.0)
         result = engine.evaluate([hand], now=0.0)
@@ -125,7 +124,7 @@ class TestEvaluate:
         # Open palm has high confidence, but let's verify the threshold
         # is applied.
         settings = make_settings(gesture_confidence_threshold=0.99)
-        engine = GestureEngine(settings)
+        engine = StaticGestureEngine(settings)
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         engine.update_motion_history([hand], now=0.0)
         result = engine.evaluate([hand], now=0.0)
@@ -138,7 +137,7 @@ class TestEvaluate:
             assert c.confidence >= 0.99
 
     def test_two_hands_evaluated_independently(self) -> None:
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         hand_a = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         hand_b = make_hand_with_scale(pose_name='peace_sign_right', role='HAND_B')
         engine.update_motion_history([hand_a, hand_b], now=0.0)
@@ -152,7 +151,7 @@ class TestEvaluate:
         """PrimaryHandFilter sets `gesture_eligible=False` for non-
         matching chirality in Dominant Hand Mode. The engine must
         skip such hands (RULES §6.7 + TRD §3.9)."""
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         from dataclasses import replace
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         # Mark as not eligible.
@@ -170,7 +169,7 @@ class TestEvaluate:
         # None. The dynamic recognizers run regardless and consume
         # motion history; in this test the buffer is empty so
         # they also return None. Net result: no candidates.
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         from dataclasses import replace
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         hand = replace(hand, scale=None)
@@ -222,7 +221,7 @@ class TestAllCandidatesGeneration:
             ),
         )
 
-        engine = GestureEngine(make_settings(gesture_confidence_threshold=0.5))
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.5))
         engine.update_motion_history([hand], now=0.0)
         result = engine.evaluate([hand], now=0.0)
         names = [c.gesture_name for c in result]
@@ -255,7 +254,7 @@ class TestAllCandidatesGeneration:
 
 class TestEngineHotPath:
     def test_malformed_hand_does_not_raise(self) -> None:
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         from dataclasses import replace
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         hand = replace(hand, landmarks=[])
@@ -269,7 +268,7 @@ class TestEngineHotPath:
         try/except, the pipeline never crashes."""
         from unittest.mock import patch
 
-        engine = GestureEngine(make_settings())
+        engine = StaticGestureEngine(make_settings())
         hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
         engine.update_motion_history([hand], now=0.0)
 

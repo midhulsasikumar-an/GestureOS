@@ -2,8 +2,8 @@
 
 Implements a deliberately simple version of TRD §3.15 (OverlayEngine):
 shows the live webcam preview with hand skeletons drawn on top, plus a
-small status overlay with the current measured FPS and detected hand
-count.
+small status overlay with the current measured FPS, detected hand
+count, and (CP-1) ML model status (LOADED / FALLBACK_ONLY / N/A).
 
 At Checkpoint 1 there is no gesture badge, no profile/context/state
 indicators, no quality-warning badges — those are added by later
@@ -18,9 +18,9 @@ supplied via the new `update_tracking_state()` slot, connected to
 the activation-state bridge in `GestureOSApp`. The badge layout is
 otherwise unchanged from CP-1.
 
-RULES §3.3: any tunable values used here should be named constants; we
-keep this minimal version without separate config.py because at CP-1
-there are no tunables yet.  Future checkpoints will introduce config.py.
+CP-1 adds the ML model status line. The status is read from
+`ModelManager.is_gesture_model_available()` at startup and shown
+in green (LOADED), yellow (FALLBACK_ONLY), or red (N/A) color.
 
 Developer Mode extension (additive, opt-in):
     When `settings.developer_mode` is True, the existing minimal badge
@@ -56,10 +56,6 @@ from models.data_models import HandData
 logger = logging.getLogger('gestureos')
 
 
-# ---------------------------------------------------------------------------
-# Public configuration constants
-# ---------------------------------------------------------------------------
-
 WINDOW_TITLE = 'GestureOS Overlay'
 STATUS_FONT_SCALE = 0.6
 STATUS_TEXT_COLOR = (255, 255, 255)   # BGR — white
@@ -67,8 +63,12 @@ STATUS_BG_COLOR = (0, 0, 0)          # BGR — black
 STATUS_BG_ALPHA = 0.55
 REFRESH_INTERVAL_MS = 33              # ~30 FPS paint timer
 
+# CP-1: ML model status colors (AI Development Guide §14.2).
+ML_STATUS_LOADED = (60, 200, 60)          # BGR — green
+ML_STATUS_FALLBACK = (60, 200, 200)       # BGR — yellow
+ML_STATUS_NA = (60, 60, 200)              # BGR — red
+
 # CP-4: activation-state indicator colors (PRD §8.10 / FR-VF-06).
-# ACTIVE is green; INACTIVE is grey. Both are BGR tuples.
 STATUS_TEXT_COLOR_ACTIVE = (60, 200, 60)     # BGR — green
 STATUS_TEXT_COLOR_INACTIVE = (170, 170, 170)  # BGR — grey
 STATUS_STATE_ACTIVE = 'ACTIVE'
@@ -88,36 +88,62 @@ def _draw_status(
     fps: float,
     hand_count: int,
     tracking_state: str = STATUS_STATE_INACTIVE,
+    ml_status: str = '',
 ) -> np.ndarray:
-    """Draw an FPS + hand-count badge in the top-left corner.
+    """Draw an FPS + hand-count + ML model status badge.
+
+    CP-1: the badge shows a third line for ML model status
+    (Implementation Plan §5 Task 1.5).
 
     CP-4: the badge text color reflects the activation state
     (PRD §8.10 FR-VF-06):
       - ACTIVE   → green  (STATUS_TEXT_COLOR_ACTIVE)
       - INACTIVE → grey   (STATUS_TEXT_COLOR_INACTIVE)
-    Backdrop and layout are unchanged from CP-1.
     """
-    text = f'FPS: {fps:5.1f}   Hands: {hand_count}'
+    lines = [f'FPS: {fps:5.1f}   Hands: {hand_count}']
+    if ml_status:
+        lines.append(f'ML: {ml_status}')
+
+    # Compute badge dimensions from the longest line.
+    max_text = max(lines, key=len)
     (tw, th), baseline = cv2.getTextSize(
-        text, cv2.FONT_HERSHEY_SIMPLEX, STATUS_FONT_SCALE, 1
+        max_text, cv2.FONT_HERSHEY_SIMPLEX, STATUS_FONT_SCALE, 1
     )
+    line_height = th + baseline + 4
+    badge_height = line_height * len(lines) + 8
+    badge_width = tw + 12
+
     x0, y0 = 8, 8
-    x1, y1 = x0 + tw + 12, y0 + th + baseline + 10
+    x1, y1 = x0 + badge_width, y0 + badge_height
     overlay = frame.copy()
     cv2.rectangle(overlay, (x0, y0), (x1, y1), STATUS_BG_COLOR, -1)
-    cv2.addWeighted(overlay[0:y1 - y0, x0:x1], STATUS_BG_ALPHA,
-                    frame[0:y1 - y0, x0:x1], 1 - STATUS_BG_ALPHA, 0,
-                    dst=frame[0:y1 - y0, x0:x1])
-    # CP-4: pick text color based on the current activation state.
+    cv2.addWeighted(
+        overlay[y0:y1, x0:x1], STATUS_BG_ALPHA,
+        frame[y0:y1, x0:x1], 1 - STATUS_BG_ALPHA, 0,
+        dst=frame[y0:y1, x0:x1],
+    )
+
     if tracking_state == STATUS_STATE_ACTIVE:
         text_color = STATUS_TEXT_COLOR_ACTIVE
     else:
         text_color = STATUS_TEXT_COLOR_INACTIVE
-    cv2.putText(
-        frame, text, (x0 + 6, y1 - baseline - 4),
-        cv2.FONT_HERSHEY_SIMPLEX, STATUS_FONT_SCALE,
-        text_color, 1, cv2.LINE_AA,
-    )
+
+    for i, line in enumerate(lines):
+        y = y0 + 8 + (i + 1) * line_height - baseline - 2
+        # ML status line uses its own color for the value portion.
+        if line.startswith('ML: ') and ml_status in ('LOADED',):
+            ml_color = ML_STATUS_LOADED
+        elif line.startswith('ML: ') and ml_status in ('FALLBACK_ONLY',):
+            ml_color = ML_STATUS_FALLBACK
+        elif line.startswith('ML: ') and ml_status in ('N/A',):
+            ml_color = ML_STATUS_NA
+        else:
+            ml_color = text_color
+        cv2.putText(
+            frame, line, (x0 + 6, y),
+            cv2.FONT_HERSHEY_SIMPLEX, STATUS_FONT_SCALE,
+            ml_color, 1, cv2.LINE_AA,
+        )
     return frame
 
 
@@ -132,6 +158,8 @@ class OverlayWindow(QWidget):
             form for forward compatibility with the gesture pipeline.
             When `gesture_state` is provided, the Developer Mode panel
             populates the gesture/stability/cooldown fields.
+        update_ml_model_status(status) — CP-1: update the ML model
+            status line in the badge.
         set_settings(settings) — update the settings reference at
             runtime (e.g., when the user toggles developer_mode via a
             future settings UI). When developer_mode is True, the
@@ -158,10 +186,9 @@ class OverlayWindow(QWidget):
         self._latest_hands: list[HandData] = []
         self._latest_fps: float = 0.0
         self._latest_gesture_state = None
+        # CP-1: ML model status string (loaded from ModelManager at startup).
+        self._ml_model_status: str = ''
         # CP-4: current activation state for the status-badge color.
-        # Initialized to INACTIVE (matches `ActivationGate`'s default
-        # on launch per FR-AM-06). Updated by `update_tracking_state`
-        # from the activation-state bridge in `GestureOSApp`.
         self._latest_tracking_state: str = STATUS_STATE_INACTIVE
 
         # Settings is held as a reference (not copied) so that a future
@@ -185,14 +212,20 @@ class OverlayWindow(QWidget):
     # -- Public API ----------------------------------------------------------
 
     def set_settings(self, settings) -> None:
-        """Replace the active settings reference.
-
-        Called when the operator toggles settings (e.g., via the future
-        settings panel — out of CP-1/3 scope). The next repaint reads
-        the new `developer_mode` value, so no further state change is
-        needed here.
-        """
+        """Replace the active settings reference."""
         self._settings = settings
+
+    def update_ml_model_status(self, status: str) -> None:
+        """CP-1: update the ML model status line displayed in the badge.
+
+        Args:
+            status: one of 'LOADED', 'FALLBACK_ONLY', or 'N/A'.
+                Any other value is treated as 'N/A'.
+        """
+        if status in ('LOADED', 'FALLBACK_ONLY', 'N/A'):
+            self._ml_model_status = status
+        else:
+            self._ml_model_status = 'N/A'
 
     def update_frame(
         self,
@@ -201,30 +234,14 @@ class OverlayWindow(QWidget):
         fps: float,
         gesture_state=None,
     ) -> None:
-        """Store the latest payload for the next paint cycle.
-
-        Called from a Qt slot connected to CaptureThread.frame_ready.
-        `gesture_state` is optional — when provided, the Developer
-        Mode panel populates the gesture/stability/cooldown fields
-        from it; when absent, those fields render as "N/A".
-        """
+        """Store the latest payload for the next paint cycle."""
         self._latest_frame = frame
         self._latest_hands = list(hands)
         self._latest_fps = float(fps)
         self._latest_gesture_state = gesture_state
 
     def update_tracking_state(self, state: str) -> None:
-        """CP-4: update the activation-state indicator color.
-
-        Called from the activation-state bridge in `GestureOSApp`
-        every time `ActivationGate.state` transitions. The next
-        paint cycle renders the badge in green (ACTIVE) or grey
-        (INACTIVE) per PRD §8.10 / FR-VF-06.
-
-        Args:
-            state: `'ACTIVE'` or `'INACTIVE'`. Any other value is
-                treated as INACTIVE (defensive).
-        """
+        """CP-4: update the activation-state indicator color."""
         if state == STATUS_STATE_ACTIVE:
             self._latest_tracking_state = STATUS_STATE_ACTIVE
         else:
@@ -244,10 +261,10 @@ class OverlayWindow(QWidget):
             self._latest_fps,
             len(self._latest_hands),
             tracking_state=self._latest_tracking_state,
+            ml_status=self._ml_model_status,
         )
 
-        # Developer Mode: opt-in, additive. Single boolean check;
-        # no allocation when off (preserves CP-1 hot-path perf budget).
+        # Developer Mode: opt-in, additive.
         developer_mode = (
             self._settings is not None
             and getattr(self._settings, 'developer_mode', False)

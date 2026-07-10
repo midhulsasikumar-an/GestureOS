@@ -25,7 +25,7 @@ from dataclasses import replace
 from typing import Iterable
 
 from models.data_models import HandData
-from tracking.hand_detector import (
+from tracking.hand_landmarker import (
     REASON_DOMINANT_HAND_MODE,
     STATUS_ACCEPTED,
     STATUS_FILTERED,

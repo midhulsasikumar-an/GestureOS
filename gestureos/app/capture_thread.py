@@ -15,11 +15,10 @@ Pipeline at Checkpoint 4 (TRD §5.1 + §16):
       → HandScaleEstimator.estimate (per hand)   (CP-2)
       → PrimaryHandFilter.filter                 (CP-2)
       → [if ActivationGate.state == ACTIVE]
-            GestureEngine.update_motion_history
-            GestureEngine.evaluate
-            ConflictResolver.resolve
-            StabilityFilter.check  (per winner)
-            CooldownFilter.check   (per stability-passed result)
+            StaticGestureEngine.update_motion_history
+            StaticGestureEngine.evaluate
+            GestureFuser.resolve
+            GestureGate.process  (Stability + Cooldown)
       → emit gesture_detected(cleared_results)
 
 Context engine (Checkpoint 6+) and action dispatch (Checkpoint 5+)
@@ -48,13 +47,12 @@ from camera.camera_module import CameraModule
 from camera.errors import CameraUnavailableError
 from diagnostics.camera_validator import CameraValidator
 from gestures.activation_gate import ActivationGate, TrackingState
-from gestures.conflict_resolver import ConflictResolver
-from gestures.cooldown_filter import CooldownFilter
-from gestures.gesture_engine import GestureEngine
-from gestures.stability_filter import StabilityFilter
+from gestures.gesture_fuser import GestureFuser
+from gestures.gesture_gate import GestureGate
+from gestures.static_gesture_engine import StaticGestureEngine
 from models.data_models import GestureResult, HandData
 from settings.settings_manager import Settings
-from tracking.hand_detector import TrackingModule, TrackingInitError
+from tracking.hand_landmarker import TrackingModule, TrackingInitError
 from tracking.hand_identity import HandIdentityModule
 from tracking.hand_scale import HandScaleEstimator
 from tracking.occlusion_handler import OcclusionHandler
@@ -118,10 +116,9 @@ class CaptureThread(QThread):
         occlusion_handler: OcclusionHandler | None = None,
         scale_estimator: HandScaleEstimator | None = None,
         primary_hand_filter: PrimaryHandFilter | None = None,
-        gesture_engine: GestureEngine | None = None,
-        conflict_resolver: ConflictResolver | None = None,
-        stability_filter: StabilityFilter | None = None,
-        cooldown_filter: CooldownFilter | None = None,
+        gesture_engine: StaticGestureEngine | None = None,
+        gesture_fuser: GestureFuser | None = None,
+        gesture_gate: GestureGate | None = None,
         activation_gate: ActivationGate | None = None,
     ) -> None:
         super().__init__()
@@ -140,9 +137,8 @@ class CaptureThread(QThread):
         self._scale_estimator = scale_estimator
         self._primary_hand_filter = primary_hand_filter
         self._gesture_engine = gesture_engine
-        self._conflict_resolver = conflict_resolver
-        self._stability_filter = stability_filter
-        self._cooldown_filter = cooldown_filter
+        self._gesture_fuser = gesture_fuser
+        self._gesture_gate = gesture_gate
         self._activation_gate = activation_gate
         self._running = False
         # Persistent RGB buffer reused every frame (RULES §12.1).
@@ -184,9 +180,8 @@ class CaptureThread(QThread):
             self._scale_estimator is not None,
             self._primary_hand_filter is not None,
             self._gesture_engine is not None,
-            self._conflict_resolver is not None,
-            self._stability_filter is not None,
-            self._cooldown_filter is not None,
+            self._gesture_fuser is not None,
+            self._gesture_gate is not None,
             self._activation_gate is not None,
         ])
 
@@ -300,12 +295,11 @@ class CaptureThread(QThread):
                 #   HandScaleEstimator (per hand) →
                 #   PrimaryHandFilter →
                 #   [ActivationGate check] →
-                #   GestureEngine → ConflictResolver →
-                #   StabilityFilter → CooldownFilter.
+                #   StaticGestureEngine → GestureFuser →
+                #   GestureGate.
                 # TRD §16 risk: StabilityFilter × ActivationGate
                 # ordering is load-bearing — ActivationGate only sees
-                # names that have ALREADY passed StabilityFilter and
-                # CooldownFilter. The integration test
+                # names that have ALREADY passed GestureGate. The integration test
                 # `test_pipeline_end_to_end.py` guards this ordering.
                 cleared_results = self._run_gesture_pipeline(hands, t0)
 
@@ -415,9 +409,8 @@ class CaptureThread(QThread):
         Ordering (TRD §5.1 stage 9 + TRD §16 explicit risk callout):
           HandIdentity → Occlusion → Scale → PrimaryHand →
           [ActivationGate.state == ACTIVE] →
-          GestureEngine.update_motion_history → GestureEngine.evaluate →
-          ConflictResolver → StabilityFilter (per winner) →
-          CooldownFilter (per stability-passed result).
+          StaticGestureEngine.update_motion_history → StaticGestureEngine.evaluate →
+          GestureFuser → GestureGate.process.
         """
         # CP-1 / unwired path — no gesture pipeline yet, or only a
         # partial wire-up from a future checkpoint. Preserve the
@@ -494,9 +487,9 @@ class CaptureThread(QThread):
             now=now,
         )
 
-        # CP-3: GestureEngine → ConflictResolver. The winners are
-        # fed into the ActivationGate's hold-timer BEFORE stability/
-        # cooldown filtering, because the gate counts consecutive
+        # CP-3: StaticGestureEngine → GestureFuser. The winners are
+        # fed into the ActivationGate's hold-timer BEFORE the
+        # GestureGate filtering, because the gate counts consecutive
         # frames (TRD §5.3 "same discipline as StabilityFilter") and
         # needs to see the gesture name on EVERY frame — not just on
         # frames where the cooldown has elapsed (which would suppress
@@ -531,55 +524,26 @@ class CaptureThread(QThread):
             )
 
             t0 = time.monotonic()
-            winners = self._conflict_resolver.resolve(candidates)
+            winners = self._gesture_fuser.resolve(candidates)
             self._diags.record_stage(
-                "ConflictResolver.resolve",
+                "GestureFuser.resolve",
                 candidates, winners,
                 (time.monotonic() - t0) * 1000,
             )
 
             # Feed the gate from every conflict-resolved winner
-            # (pre-stability, pre-cooldown). The gate must see every
+            # (pre-gesture-gate). The gate must see every
             # qualifying frame to run its hold-timer.
             for winner in winners:
                 self._activation_gate.feed_gesture(winner.gesture_name, now)
 
-            # Apply StabilityFilter per winner.
+            # Apply GestureGate (StabilityFilter + CooldownFilter in one pass).
             self._cleared_results.clear()
-            stable_results: list[GestureResult] = []
             t0 = time.monotonic()
-            for winner in winners:
-                stable = self._stability_filter.check(
-                    winner.hand_role, winner, now
-                )
-                if stable is None:
-                    continue
-                stable_results.append(stable)
-            st_ms = (time.monotonic() - t0) * 1000
-            reject_reason_st = (
-                None if len(stable_results) == len(winners)
-                else "stability_hold_timer"
-            )
+            self._cleared_results = self._gesture_gate.process(winners, now)
+            gate_ms = (time.monotonic() - t0) * 1000
             self._diags.record_stage(
-                "StabilityFilter", winners, stable_results, st_ms,
-                rejection_reason=reject_reason_st,
-            )
-
-            # Apply CooldownFilter per stable result.
-            t0 = time.monotonic()
-            for stable in stable_results:
-                cleared = self._cooldown_filter.check(stable, now)
-                if cleared is None:
-                    continue
-                self._cleared_results.append(cleared)
-            cd_ms = (time.monotonic() - t0) * 1000
-            reject_reason_cd = (
-                None if len(self._cleared_results) == len(stable_results)
-                else "cooldown_active"
-            )
-            self._diags.record_stage(
-                "CooldownFilter", stable_results, self._cleared_results, cd_ms,
-                rejection_reason=reject_reason_cd,
+                "GestureGate", winners, self._cleared_results, gate_ms,
             )
 
             # Rebuild the gesture state with the richer CP-3/CP-4 data
@@ -652,22 +616,20 @@ class CaptureThread(QThread):
                 final_gesture[r.hand_role] = r.gesture_name
                 final_gesture_confidence[r.hand_role] = r.confidence
 
-        # Stability status from StabilityFilter.holds_in_progress.
-        # The read-only accessor returns {role: (gesture_name, start_s)}.
+        # Stability status from GestureGate.stability.holds_in_progress.
         stability_status: dict[str, str] = {}
-        if self._stability_filter is not None:
-            for role, (name, start_s) in self._stability_filter.holds_in_progress.items():
+        if self._gesture_gate is not None:
+            for role, (name, start_s) in self._gesture_gate.stability.holds_in_progress.items():
                 elapsed_ms = int((now - start_s) * 1000)
                 stability_status[role] = f"held {elapsed_ms}ms"
 
-        # Cooldown status from CooldownFilter.remaining_ms() for each
-        # (role, gesture) pair that is currently on cooldown.
+        # Cooldown status from GestureGate.cooldown.remaining_ms().
         cooldown_status: dict[str, str] = {}
-        if self._cooldown_filter is not None:
+        if self._gesture_gate is not None:
             for (role, gesture_name), last_ts in (
-                self._cooldown_filter.last_trigger_snapshot.items()
+                self._gesture_gate.cooldown.last_trigger_snapshot.items()
             ):
-                remaining = self._cooldown_filter.remaining_ms(
+                remaining = self._gesture_gate.cooldown.remaining_ms(
                     role, gesture_name, now
                 )
                 if remaining > 0:

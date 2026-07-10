@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from gestures.stability_filter import (
+from gestures.gesture_gate import (
     DEFAULT_HOLD_WINDOW_MS,
     StabilityFilter,
 )

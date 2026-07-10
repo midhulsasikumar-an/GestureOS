@@ -103,7 +103,7 @@ PANEL_MIN_HEIGHT_PX: int = 60   # smallest drawable panel
 PANEL_MAX_WIDTH_FRACTION: float = 0.42
 
 # CP-4 Tracking Stabilization — per-hand status values rendered in the
-# panel. These mirror the constants in `tracking.hand_detector`; the
+# panel. These mirror the constants in `tracking.hand_landmarker`; the
 # debug panel reads them off `HandData.status` / `HandData.status_reason`
 # directly and the strings are stable for the operator's eye.
 STATUS_LABELS: dict[str, str] = {
@@ -132,8 +132,7 @@ class GesturePipelineState:
     Developer Mode panel.
 
     This is a forward-compatible input: when CP-4 wires
-    `GestureEngine` → `ConflictResolver` → `StabilityFilter` →
-    `CooldownFilter` results into the `CaptureThread.frame_ready`
+    `StaticGestureEngine` → `GestureFuser` → `GestureGate` results into the `CaptureThread.frame_ready`
     signal, the caller can pass that state here and the panel will
     render it automatically. Until then, the panel shows "N/A"
     for these fields.

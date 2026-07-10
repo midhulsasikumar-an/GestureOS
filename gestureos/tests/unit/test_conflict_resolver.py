@@ -1,4 +1,4 @@
-"""Unit tests for ConflictResolver — CP-3.
+"""Unit tests for GestureFuser — CP-3.
 
 Per TRD §3.9.1 + PRD §4.6 (FR-CR-01..04):
   - FR-CR-01: single candidate per role -> pass-through
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from gestures.conflict_resolver import (
+from gestures.gesture_fuser import (
     GESTURE_TIE_BREAK_PRIORITY,
-    ConflictResolver,
+    GestureFuser,
 )
 from models.data_models import GestureResult
 
@@ -55,7 +55,7 @@ class TestPriorityTable:
 
 class TestPassThrough:
     def test_single_candidate_passes_through_unchanged(self) -> None:
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidate = GestureResult(
             gesture_name='open_palm',
             confidence=0.90,
@@ -68,7 +68,7 @@ class TestPassThrough:
         assert winners[0] is candidate
 
     def test_empty_input_returns_empty(self) -> None:
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         assert resolver.resolve([]) == []
 
 
@@ -78,7 +78,7 @@ class TestPassThrough:
 
 class TestHighestConfidenceWins:
     def test_higher_confidence_wins(self) -> None:
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult(
                 gesture_name='peace_sign',
@@ -100,7 +100,7 @@ class TestHighestConfidenceWins:
         assert winners[0].gesture_name == 'three_fingers'
 
     def test_three_candidates_highest_wins(self) -> None:
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('open_palm', 0.70, False, 'HAND_A', 0.0),
             GestureResult('peace_sign', 0.85, False, 'HAND_A', 0.0),
@@ -117,7 +117,7 @@ class TestHighestConfidenceWins:
 class TestTieBreakByPriority:
     def test_tied_pinch_vs_peace_sign(self) -> None:
         # Pinch (priority 0) beats Peace Sign (priority 2) at equal confidence.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('peace_sign', 0.85, False, 'HAND_A', 0.0),
             GestureResult('pinch', 0.85, False, 'HAND_A', 0.0),
@@ -127,7 +127,7 @@ class TestTieBreakByPriority:
 
     def test_tied_thumbs_up_vs_open_palm(self) -> None:
         # Thumbs Up (priority 1) beats Open Palm (priority 5) at equal confidence.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('open_palm', 0.90, False, 'HAND_A', 0.0),
             GestureResult('thumbs_up', 0.90, False, 'HAND_A', 0.0),
@@ -136,7 +136,7 @@ class TestTieBreakByPriority:
         assert winners[0].gesture_name == 'thumbs_up'
 
     def test_three_way_tie_breaks_by_priority(self) -> None:
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('open_palm', 0.85, False, 'HAND_A', 0.0),
             GestureResult('three_fingers', 0.85, False, 'HAND_A', 0.0),
@@ -149,7 +149,7 @@ class TestTieBreakByPriority:
     def test_tie_with_no_priority_entry_uses_default(self) -> None:
         # A gesture name not in the priority table gets default
         # priority 99 (last resort).
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('unknown_gesture', 0.85, False, 'HAND_A', 0.0),
             GestureResult('pinch', 0.85, False, 'HAND_A', 0.0),
@@ -167,7 +167,7 @@ class TestPerRoleIndependence:
         # HAND_A: pinch wins (high confidence)
         # HAND_B: open_palm wins (high confidence)
         # They must NOT affect each other.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('pinch', 0.90, False, 'HAND_A', 0.0),
             GestureResult('three_fingers', 0.80, False, 'HAND_A', 0.0),
@@ -182,7 +182,7 @@ class TestPerRoleIndependence:
 
     def test_one_hand_with_multiple_candidates(self) -> None:
         # Only HAND_A has multiple candidates; HAND_B has none.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('pinch', 0.85, False, 'HAND_A', 0.0),
             GestureResult('three_fingers', 0.85, False, 'HAND_A', 0.0),
@@ -195,7 +195,7 @@ class TestPerRoleIndependence:
         # FR-CR-04 explicit: a conflict on one hand never affects the
         # other hand. Verify by constructing two completely independent
         # role sets.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates_a = [
             GestureResult('open_palm', 0.90, False, 'HAND_A', 0.0),
             GestureResult('fist', 0.92, False, 'HAND_A', 0.0),
@@ -220,7 +220,7 @@ class TestTrdWorkedExample:
     def test_prd_worked_example(self) -> None:
         """PRD §4.6: peace_sign 0.81 vs three_fingers 0.88 -> three_fingers
         wins (higher confidence, no tie)."""
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult(
                 gesture_name='peace_sign',
@@ -249,7 +249,7 @@ class TestHotPathNeverRaises:
     def test_malformed_candidate_dropped(self) -> None:
         # A candidate with hand_role == '' is dropped with a warning,
         # never propagates an exception.
-        resolver = ConflictResolver()
+        resolver = GestureFuser()
         candidates = [
             GestureResult('pinch', 0.85, False, '', 0.0),  # empty role
             GestureResult('peace_sign', 0.80, False, 'HAND_A', 0.0),

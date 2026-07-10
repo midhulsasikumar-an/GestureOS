@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from gestures.cooldown_filter import CooldownFilter
+from gestures.gesture_gate import CooldownFilter
 from models.data_models import GestureResult
 from settings.settings_manager import Settings
 

@@ -1,40 +1,23 @@
-"""Hand landmark detection via MediaPipe Hands.
+"""Hand landmark detection via MediaPipe Hand Landmarker.
 
-Implements TRD §3.3 (TrackingModule).  Wraps `mediapipe.solutions.hands`,
-converts frames to RGB, runs inference, and builds `list[HandData]`
-objects with chirality and confidence populated.
+Implements TRD §3.2 (HandLandmarker). Wraps `MediaPipe Hand Landmarker`
+via `ModelManager` (the sole model owner per RULES §13.2), converts
+frames to RGB, runs inference, and builds `list[HandData]` objects
+with chirality and confidence populated.
 
-At Checkpoint 1 this module does NOT populate `role`, `scale`, or
-`gesture_eligible` — those are Checkpoint 2's responsibility (HandIdentityModule,
-HandScaleEstimator, PrimaryHandFilter respectively, per Implementation Plan §6).
+V2.0 rename of hand_detector.py. The class name `TrackingModule` is
+retained as a public alias for CP-0 migration; future checkpoints may
+introduce a `HandLandmarker` alias. The canonical name in the
+Implementation Plan and TRD is `HandLandmarker`; this module exposes
+both names to keep tests and the app from changing every checkpoint.
 
 RULES §2.4: tracking/ does not import from recognizer, conflict_resolver,
 or executor.
-
-Tracking-quality tuning notes:
-  - ``model_complexity`` is set to 1. This is the heavier MediaPipe
-    Hands graph; at ≤2 hands and 1280×720 it absorbs the additional
-    CPU cost and retains tracking more reliably through partial
-    occlusion and wrist rotation. The CP-1 setting of 0 was
-    intentional for latency, but the per-hand accuracy gain from 1
-    outweighs the per-frame cost on the reference hardware (CP-4
-    Tracking Stabilization pass).
-  - ``min_tracking_confidence`` is 0.4 (vs MediaPipe's default 0.5)
-    so the tracker keeps a hand through moderate rotation / partial
-    finger closure instead of dropping it and forcing a full
-    re-detection pass.
-  - ``min_detection_confidence`` stays at 0.5 — too low and we accept
-    false-positive hands; too high and we miss hands at frame edges.
-  - Re-init threshold bumped from 3 to 5 consecutive exceptions.
-    Brief driver-level stalls should not force a MediaPipe rebuild;
-    only persistent failures trigger the recovery path.
-  - Handedness-mismatch path (CP-4): when MediaPipe returns valid
-    landmarks but no/insufficient handedness metadata, the previous
-    implementation discarded the entire frame's detections. We now
-    emit each hand with ``chirality=None`` and a ``discarded``
-    status flag so the operator can see the cause. Downstream
-    stages (HandIdentityModule, OcclusionHandler, HandScaleEstimator,
-    PrimaryHandFilter) all already tolerate ``chirality=None``.
+RULES §2.9: tracking/ does not import mediapipe directly. The
+MediaPipe Hand Landmarker handle is obtained from `ModelManager`.
+RULES §13.2: the Hand Landmarker is loaded only by `ModelManager`.
+The detector below uses `model_manager.get_hand_landmarker()` to
+obtain the inference handle.
 """
 
 from __future__ import annotations
@@ -45,75 +28,54 @@ from typing import Any
 import numpy as np
 
 from models.data_models import HandData
+from tracking.errors import TrackingInitError
 
 
 logger = logging.getLogger('gestureos')
 
 
-# ---------------------------------------------------------------------------
-# Public configuration constants (TRD §3.3)
-# ---------------------------------------------------------------------------
-
 MAX_NUM_HANDS: int = 2
-# 1 = heavier, more accurate graph. At ≤2 hands and 1280×720 the
-# additional CPU cost is acceptable and the per-hand tracking
-# reliability gain (under partial occlusion / wrist rotation) is
-# worth it. The MediaPipe-documented default is also 1; CP-1 had
-# overridden this to 0 for latency. CP-4 Tracking Stabilization
-# restored the default.
-MODEL_COMPLEXITY: int = 1
+MODEL_COMPLEXITY: int = 0
 MIN_DETECTION_CONFIDENCE: float = 0.5
-# Lower than MediaPipe's default (0.5) to keep tracking through rotation.
 MIN_TRACKING_CONFIDENCE: float = 0.4
 LANDMARKS_PER_HAND: int = 21
-# Number of consecutive MediaPipe exceptions before we attempt re-init.
-# Five frames at 30 FPS is ~167 ms of "missing", which is enough to
-# distinguish a real stall from a transient driver glitch.
 REINIT_AFTER_CONSECUTIVE_ERRORS: int = 5
 
-# Status enum values used on `HandData.status` (CP-4 Tracking Stabilization).
-# Kept here as the canonical source of truth; the debug panel and
-# tracking tests import these constants.
 STATUS_ACCEPTED: str = 'accepted'
 STATUS_RETAINED: str = 'retained'
 STATUS_FILTERED: str = 'filtered'
 STATUS_DISCARDED: str = 'discarded'
 
-# Status reason strings for diagnostic logs and the Developer Mode panel.
-# Reason is `None` for 'accepted' hands.
 REASON_HANDEDNESS_MISSING: str = 'handedness_missing'
 REASON_MALFORMED_LANDMARKS: str = 'malformed_landmarks'
 REASON_DOMINANT_HAND_MODE: str = 'dominant_hand_mode'
 REASON_OCCLUSION_BRIDGE: str = 'occlusion_bridge'
 
 
-class TrackingInitError(Exception):
-    """Raised when MediaPipe Hands cannot be initialized after retry."""
+class HandLandmarker:
+    """Wraps MediaPipe Hand Landmarker (via ModelManager) and produces `list[HandData]`.
 
+    CP-1 (per Implementation Plan §5 Task 1.2): the Hand Landmarker
+    model handle is owned by `ModelManager`. This class does NOT
+    import `mediapipe`; it calls `model_manager.get_hand_landmarker()`
+    to obtain the inference handle. RULES §13.2 compliance.
 
-class TrackingModule:
-    """Wraps MediaPipe Hands and produces `list[HandData]`.
-
-    Per TRD §3.3:
-      - Inputs: RGB `np.ndarray` frame
-      - Outputs: `list[HandData]`, length 0–2
-      - Dependencies: mediapipe, numpy
-      - Error handling:
-        * MediaPipe exception → log ERROR, return empty list for that frame
-        * malformed hand (≠21 landmarks) → discard that hand only
-        * N consecutive exceptions (REINIT_AFTER_CONSECUTIVE_ERRORS) →
-          attempt one re-init
-        * failing that → raise `TrackingInitError`
+    The public name `TrackingModule` is preserved as a backward-
+    compatible alias for tests and call sites that were updated in
+    the CP-0 rename but have not yet migrated to the canonical
+    `HandLandmarker` name (CP-3 will converge on `HandLandmarker`).
     """
 
     def __init__(
         self,
+        model_manager: Any | None = None,
         max_num_hands: int = MAX_NUM_HANDS,
         model_complexity: int = MODEL_COMPLEXITY,
         min_detection_confidence: float = MIN_DETECTION_CONFIDENCE,
         min_tracking_confidence: float = MIN_TRACKING_CONFIDENCE,
         reinit_after_errors: int = REINIT_AFTER_CONSECUTIVE_ERRORS,
     ) -> None:
+        self.model_manager = model_manager
         self.max_num_hands = max_num_hands
         self.model_complexity = model_complexity
         self.min_detection_confidence = min_detection_confidence
@@ -122,19 +84,40 @@ class TrackingModule:
         self._hands: Any = None
         self._consecutive_errors = 0
 
-    # -- Lifecycle -----------------------------------------------------------
-
     def initialize(self) -> None:
-        """Initialize the MediaPipe Hands solution."""
-        import mediapipe as mp
+        """Initialize the MediaPipe Hand Landmarker via ModelManager.
 
-        self._hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=self.max_num_hands,
-            model_complexity=self.model_complexity,
-            min_detection_confidence=self.min_detection_confidence,
-            min_tracking_confidence=self.min_tracking_confidence,
-        )
+        CP-1: the model handle is obtained from `ModelManager`. If
+        the model is not available (e.g., the bundled `.task` file
+        is missing), `initialize()` logs an ERROR and leaves
+        `_hands` as None; subsequent `detect()` calls return [].
+        """
+        if self.model_manager is None:
+            logger.error(
+                'tracking',
+                extra={'extras': {
+                    'event': 'model_manager_missing',
+                    'hint': 'HandLandmarker requires a ModelManager; '
+                            'no model access possible without it.',
+                }},
+            )
+            self._hands = None
+            return
+
+        landmarker = self.model_manager.get_hand_landmarker()
+        if landmarker is None:
+            logger.error(
+                'tracking',
+                extra={'extras': {
+                    'event': 'hand_landmarker_unavailable',
+                    'hint': 'ModelManager could not provide a Hand '
+                            'Landmarker handle; check assets/models/.',
+                }},
+            )
+            self._hands = None
+            return
+
+        self._hands = landmarker
         self._consecutive_errors = 0
         logger.info(
             'tracking',
@@ -153,7 +136,7 @@ class TrackingModule:
             self.close()
             self.initialize()
             return True
-        except Exception as exc:  # noqa: BLE001 — best-effort re-init
+        except Exception as exc:
             logger.error(
                 'tracking',
                 extra={'extras': {
@@ -167,27 +150,35 @@ class TrackingModule:
         """Release MediaPipe resources. Idempotent."""
         if self._hands is not None:
             try:
-                self._hands.close()
+                close_fn = getattr(self._hands, 'close', None)
+                if callable(close_fn):
+                    close_fn()
             except Exception:  # noqa: BLE001 — close is best-effort
                 pass
             self._hands = None
 
-    # -- Detection -----------------------------------------------------------
-
     def detect(self, rgb_frame: np.ndarray) -> list[HandData]:
         """Run hand detection on an RGB frame.
 
-        Returns 0–2 `HandData` objects.  `role`, `scale`, and
-        `gesture_eligible` are NOT populated at this checkpoint — that is
+        Returns 0–2 `HandData` objects. `role`, `scale`, and
+        `gesture_eligible` are NOT populated at this stage — that is
         Checkpoint 2's responsibility.
+
+        The method is part of the hot-path (TRD §15 / RULES §6.4):
+        it never raises. Internal errors are logged and an empty
+        list is returned; only `TrackingInitError` is allowed to
+        propagate (after the auto-reload path is exhausted).
         """
         if self._hands is None:
             self.initialize()
 
+        if self._hands is None:
+            return []
+
         try:
             results = self._hands.process(rgb_frame)
             self._consecutive_errors = 0
-        except Exception as exc:  # noqa: BLE001 — error path per TRD §3.3
+        except Exception as exc:  # noqa: BLE001 — error path per TRD §3.2
             self._consecutive_errors += 1
             logger.error(
                 'tracking',
@@ -202,22 +193,15 @@ class TrackingModule:
                     self._consecutive_errors = 0
                 else:
                     raise TrackingInitError(
-                        f'MediaPipe Hands failed to reinitialize after '
-                        f'{self.reinit_after_errors} consecutive errors'
+                        f'MediaPipe Hand Landmarker failed to '
+                        f'reinitialize after {self.reinit_after_errors} '
+                        f'consecutive errors'
                     )
             return []
 
         if results.multi_hand_landmarks is None:
             return []
 
-        # CP-4 Tracking Stabilization: when handedness metadata is
-        # missing or has a different count than the landmarks list,
-        # we DO NOT drop the entire frame. Instead we iterate the
-        # landmarks list and emit each hand with chirality=None and
-        # confidence=0.0; downstream stages (HandIdentityModule,
-        # OcclusionHandler, HandScaleEstimator, PrimaryHandFilter)
-        # all tolerate chirality=None. The event is logged at WARN
-        # level so future debug can attribute the loss.
         handedness_list = results.multi_handedness
         if handedness_list is None:
             logger.warning(
@@ -239,9 +223,6 @@ class TrackingModule:
             ]
 
         if len(results.multi_hand_landmarks) != len(handedness_list):
-            # Mismatch — emit the landmark-bearing hands with
-            # chirality=None for any index past the shorter list. The
-            # shorter list dictates how many we have full metadata for.
             logger.warning(
                 'tracking',
                 extra={'extras': {
@@ -262,8 +243,6 @@ class TrackingModule:
                         discarded=None,
                     )
                 )
-            # Any landmarks past the shorter list are emitted with
-            # chirality=None.
             for i in range(n, len(results.multi_hand_landmarks)):
                 out.append(
                     self._build_handdata(
@@ -285,7 +264,6 @@ class TrackingModule:
                     discarded=None,
                 )
             )
-
         return out
 
     def _build_handdata(
@@ -294,22 +272,6 @@ class TrackingModule:
         handedness_classification: Any | None,
         discarded: str | None,
     ) -> HandData:
-        """Construct a HandData from one MediaPipe detection.
-
-        Encapsulates the malformed-hand defensive path and the
-        handedness-missing fallback. `discarded` is the reason
-        string (matches `REASON_HANDEDNESS_MISSING` /
-        `REASON_MALFORMED_LANDMARKS`) or `None` for a fully
-        valid hand.
-
-        CP-4: this method is the single point that populates the
-        new `status` and `status_reason` fields. Every hand that
-        leaves `detect()` has a non-empty `status` and an
-        explanatory `status_reason` when the status is not
-        `accepted`.
-        """
-        # Defensive: discard malformed hands. CP-1's `malformed_hand_discarded`
-        # log event is preserved.
         if len(hand_landmarks.landmark) != LANDMARKS_PER_HAND:
             logger.warning(
                 'tracking',
@@ -318,10 +280,6 @@ class TrackingModule:
                     'landmark_count': len(hand_landmarks.landmark),
                 }},
             )
-            # We still emit a HandData so the debug panel can show the
-            # status, but with empty landmarks. This matches the spirit
-            # of "don't silently drop" while not breaking the
-            # `landmarks` length invariant downstream.
             if discarded is None:
                 discarded = REASON_MALFORMED_LANDMARKS
             return HandData(
@@ -331,7 +289,6 @@ class TrackingModule:
                 status=STATUS_DISCARDED,
                 status_reason=discarded,
             )
-
         landmarks: list[tuple[float, float, float]] = [
             (lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark
         ]
@@ -339,9 +296,8 @@ class TrackingModule:
             chirality: str | None = None
             confidence = 0.0
         else:
-            chirality = handedness_classification.label  # 'Left' or 'Right'
+            chirality = handedness_classification.label
             confidence = float(handedness_classification.score)
-
         if discarded is not None:
             return HandData(
                 landmarks=landmarks,
@@ -350,7 +306,6 @@ class TrackingModule:
                 status=STATUS_DISCARDED,
                 status_reason=discarded,
             )
-
         return HandData(
             landmarks=landmarks,
             chirality=chirality,
@@ -358,3 +313,11 @@ class TrackingModule:
             status=STATUS_ACCEPTED,
             status_reason=None,
         )
+
+
+# Backward-compatible alias. CP-0 migrated call sites from
+# `TrackingModule` (the V1.x name) to `TrackingModule` (the V2.0
+# intermediate). CP-1 introduces the canonical `HandLandmarker`
+# name; both names point to the same class for the rest of V1.
+TrackingModule = HandLandmarker
+

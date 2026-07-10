@@ -47,10 +47,9 @@ from gestures.activation_gate import (
     ActivationGate,
     TrackingState,
 )
-from gestures.conflict_resolver import ConflictResolver
-from gestures.cooldown_filter import CooldownFilter
-from gestures.gesture_engine import GestureEngine
-from gestures.stability_filter import StabilityFilter
+from gestures.gesture_fuser import GestureFuser
+from gestures.gesture_gate import GestureGate
+from gestures.static_gesture_engine import StaticGestureEngine
 from models.data_models import GestureResult, HandData
 from settings.settings_manager import Settings
 from tests.conftest import make_hand_with_scale
@@ -79,12 +78,12 @@ class Pipeline:
         self.primary_hand_filter = PrimaryHandFilter(
             dominant_hand_mode=self.settings.dominant_hand_mode,
         )
-        self.gesture_engine = GestureEngine(settings=self.settings)
-        self.conflict_resolver = ConflictResolver()
-        self.stability_filter = StabilityFilter(
-            window_ms=self.settings.gesture_stability_window_ms,
+        self.gesture_engine = StaticGestureEngine(settings=self.settings)
+        self.gesture_fuser = GestureFuser()
+        self.gesture_gate = GestureGate(
+            settings=self.settings,
+            stability_window_ms=self.settings.gesture_stability_window_ms,
         )
-        self.cooldown_filter = CooldownFilter(settings=self.settings)
         self.activation_gate = ActivationGate(
             hold_duration_s=self.settings.activation_hold_duration_s,
             enable_closed_fist=False,
@@ -105,28 +104,18 @@ class Pipeline:
         scaled = [self.scale_estimator.estimate(h) for h in bridged]
         filtered = self.primary_hand_filter.filter(scaled)
 
-        # CP-3: GestureEngine → ConflictResolver. Runs REGARDLESS of
+        # CP-3: GestureEngine → GestureFuser → GestureGate. Runs REGARDLESS of
         # activation state — the ActivationGate must receive
         # `feed_gesture` on every frame to count consecutive Open
         # Palm frames and toggle itself INACTIVE → ACTIVE.
         self.gesture_engine.update_motion_history(filtered, now)
         candidates = self.gesture_engine.evaluate(filtered, now)
-        winners = self.conflict_resolver.resolve(candidates)
+        winners = self.gesture_fuser.resolve(candidates)
 
         for winner in winners:
             self.activation_gate.feed_gesture(winner.gesture_name, now)
 
-        cleared: list[GestureResult] = []
-        for winner in winners:
-            stable = self.stability_filter.check(
-                winner.hand_role, winner, now
-            )
-            if stable is None:
-                continue
-            cooled = self.cooldown_filter.check(stable, now)
-            if cooled is None:
-                continue
-            cleared.append(cooled)
+        cleared = self.gesture_gate.process(winners, now)
 
         # FR-AM-01: suppress dispatch (cleared_results) when INACTIVE.
         # CP-3 still ran so the ActivationGate can count Open Palm
@@ -342,7 +331,7 @@ class TestCaptureThreadUnwired:
         from app.capture_thread import CaptureThread
         from camera.camera_module import CameraModule
         from diagnostics.camera_validator import CameraValidator
-        from tracking.hand_detector import TrackingModule
+        from tracking.hand_landmarker import TrackingModule
 
         # CaptureThread with NO pipeline components — the original
         # CP-1 signature (camera, tracking, validator, settings).

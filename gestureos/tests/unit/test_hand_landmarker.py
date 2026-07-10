@@ -1,7 +1,8 @@
-"""Unit tests for TrackingModule (hand_detector.py) — CP-4 Tracking Stabilization.
+"""Unit tests for HandLandmarker (tracking/hand_landmarker.py) — CP-1 + CP-4.
 
 Tests cover:
-  - MODEL_COMPLEXITY constant is 1 (CP-4 change)
+  - MODEL_COMPLEXITY constant is 0 (per user config)
+  - HandLandmarker accepts ModelManager for RULES §13.2 compliance (CP-1)
   - Normal detection path with full handedness metadata
   - Handedness metadata missing entirely (multi_handedness=None)
   - Handedness count < landmarks count (partial chirality loss)
@@ -9,6 +10,7 @@ Tests cover:
   - Malformed hand (<21 landmarks) is still dropped
   - Status and status_reason fields are populated on every path
   - Empty frame returns []
+  - No model_manager logged error (CP-1 graceful degradation)
 
 Per TRD §13.2: no live camera. MediaPipe results are mocked with
 named tuples matching the actual NamedTuple shape MediaPipe returns.
@@ -24,7 +26,7 @@ import numpy as np
 import pytest
 
 from models.data_models import HandData
-from tracking.hand_detector import (
+from tracking.hand_landmarker import (
     LANDMARKS_PER_HAND,
     MAX_NUM_HANDS,
     MIN_DETECTION_CONFIDENCE,
@@ -110,11 +112,11 @@ def _make_results(
 # ======================================================================
 
 class TestConstruction:
-    """CP-4: MODEL_COMPLEXITY must be 1."""
+    """MODEL_COMPLEXITY must be 0 (per user config)."""
 
-    def test_model_complexity_is_1(self) -> None:
-        assert MODEL_COMPLEXITY == 1, (
-            f'CP-4 requires MODEL_COMPLEXITY=1; got {MODEL_COMPLEXITY}'
+    def test_model_complexity_is_0(self) -> None:
+        assert MODEL_COMPLEXITY == 0, (
+            f'Expected MODEL_COMPLEXITY=0; got {MODEL_COMPLEXITY}'
         )
 
     def test_other_constants_preserved(self) -> None:
@@ -130,12 +132,26 @@ class TestConstruction:
         assert m.min_detection_confidence == MIN_DETECTION_CONFIDENCE
         assert m.min_tracking_confidence == MIN_TRACKING_CONFIDENCE
 
-    def test_initialize_logs_model_complexity(self) -> None:
-        with patch('tracking.hand_detector.logger') as mock_log:
-            m = TrackingModule()
+    def test_construction_with_model_manager(self) -> None:
+        mock_mgr = MagicMock()
+        m = TrackingModule(model_manager=mock_mgr)
+        assert m.model_manager is mock_mgr
+
+    def test_initialize_without_model_manager_logs_and_sets_none(self) -> None:
+        m = TrackingModule()
+        with patch('tracking.hand_landmarker.logger') as mock_log:
             m.initialize()
-            # Verify the initialize path set the right constant
-            assert m._hands is not None
+        assert m._hands is None
+        mock_log.error.assert_called_once()
+
+    def test_initialize_with_mock_model_manager(self) -> None:
+        mock_mgr = MagicMock()
+        mock_mgr.get_hand_landmarker.return_value = MagicMock()
+        m = TrackingModule(model_manager=mock_mgr)
+        with patch('tracking.hand_landmarker.logger') as mock_log:
+            m.initialize()
+        assert m._hands is not None
+        mock_log.info.assert_called_once()
 
 
 # ======================================================================
@@ -162,7 +178,6 @@ class TestNormalDetection:
     def test_two_hands_both_accepted(self) -> None:
         m = TrackingModule()
         with patch.object(m, '_hands') as mock_hands:
-            # Two entries each with their own handedness metadata.
             results = _Results(
                 multi_hand_landmarks=[
                     _HandLandmarks(landmark=_make_landmarks()),
@@ -215,8 +230,6 @@ class TestHandednessMissing:
             assert h.status_reason == REASON_HANDEDNESS_MISSING
 
     def test_handedness_partial_missing(self) -> None:
-        """2 landmarks but only 1 handedness entry: first hand gets full
-        metadata, second gets chirality=None."""
         m = TrackingModule()
         with patch.object(m, '_hands') as mock_hands:
             results = _Results(
@@ -238,8 +251,6 @@ class TestHandednessMissing:
         assert out[1].status_reason == REASON_HANDEDNESS_MISSING
 
     def test_handedness_more_than_landmarks(self) -> None:
-        """1 landmark but 2 handedness entries: only one hand emitted.
-        No crash."""
         m = TrackingModule()
         with patch.object(m, '_hands') as mock_hands:
             results = _Results(
@@ -253,15 +264,11 @@ class TestHandednessMissing:
             )
             mock_hands.process.return_value = results
             out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        # Landmarks list is shorter → only one hand can be made.
         assert len(out) == 1
         assert out[0].chirality == 'Left'
         assert out[0].status == STATUS_ACCEPTED
 
     def test_malformed_hand_is_discarded_with_reason(self) -> None:
-        """CP-4: malformed landmarks are still emitted with status
-        'discarded' and reason 'malformed_landmarks' so the debug
-        panel can show them."""
         m = TrackingModule()
         with patch.object(m, '_hands') as mock_hands:
             mock_hands.process.return_value = _make_results(
@@ -272,7 +279,6 @@ class TestHandednessMissing:
         assert out[0].status == STATUS_DISCARDED
         assert out[0].status_reason == REASON_MALFORMED_LANDMARKS
         assert out[0].confidence == pytest.approx(0.0)
-        # Landmarks list is empty for malformed hands.
         assert out[0].landmarks == []
 
 
@@ -298,10 +304,6 @@ class TestMediaPipeException:
             for _ in range(3):
                 out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
                 assert out == []
-            # On the 4th call with reinit_after_errors=3, re-init is
-            # attempted. The mock has no real re-init path, but the
-            # method should not raise because the except clause in
-            # reinitialize will catch the failure.
             out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
             assert out == []
 
@@ -315,7 +317,7 @@ class TestStatusConstants:
     panel and structured log extras; renaming them is a breaking change."""
 
     def test_status_strings_pinned(self) -> None:
-        from tracking.hand_detector import (
+        from tracking.hand_landmarker import (
             REASON_DOMINANT_HAND_MODE,
             REASON_HANDEDNESS_MISSING,
             REASON_OCCLUSION_BRIDGE,

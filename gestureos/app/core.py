@@ -11,8 +11,7 @@ The app owns:
   - a CaptureThread (Checkpoint 1) that runs the per-frame pipeline
   - CP-2 pipeline: HandIdentityModule, OcclusionHandler,
     HandScaleEstimator, PrimaryHandFilter
-  - CP-3 pipeline: GestureEngine, ConflictResolver, StabilityFilter,
-    CooldownFilter
+  - CP-3 pipeline: StaticGestureEngine, GestureFuser, GestureGate
   - CP-4: ActivationGate (the binary safety gate)
 
 Lifecycle:
@@ -43,13 +42,13 @@ from camera.camera_module import CameraModule
 from diagnostics.camera_validator import CameraValidator
 from diagnostics.diagnostics_manager import DiagnosticsManager
 from gestures.activation_gate import ActivationGate, TrackingState
-from gestures.conflict_resolver import ConflictResolver
-from gestures.cooldown_filter import CooldownFilter
-from gestures.gesture_engine import GestureEngine
-from gestures.stability_filter import StabilityFilter
+from gestures.gesture_fuser import GestureFuser
+from gestures.gesture_gate import GestureGate
+from gestures.static_gesture_engine import StaticGestureEngine
+from models.model_manager import ModelManager
 from overlay.overlay_window import OverlayWindow
 from settings.settings_manager import Settings, SettingsManager
-from tracking.hand_detector import TrackingModule
+from tracking.hand_landmarker import TrackingModule
 from tracking.hand_identity import HandIdentityModule
 from tracking.hand_scale import HandScaleEstimator
 from tracking.occlusion_handler import OcclusionHandler
@@ -123,6 +122,20 @@ class GestureOSApp:
         self.settings: Settings = self._settings_mgr.load()
         self._qapp = qapp
 
+        # CP-1: initialize ModelManager singleton and load all ML models.
+        # The manager owns every model handle (RULES §13.2). Model file
+        # paths are resolved relative to `assets/models/`. If a model
+        # file is absent, ModelManager logs an ERROR and continues
+        # gracefully — the pipeline degrades without crashing.
+        self._model_manager = ModelManager.get_instance()
+        self._model_manager.load_all()
+
+        # CP-1: populate ExtensionRegistry with all built-in
+        # implementations. At CP-1 only the registrations happen; the
+        # implementations are consumed by later checkpoints (CP-3 for
+        # MediaPipeGestureEngine, CP-5 for WindowsExecutor/ContextAdapter).
+        self._populate_extension_registry()
+
         # Non-Qt components built fresh per app instance (each owns its
         # own native handles).
         self._camera = CameraModule(
@@ -130,7 +143,9 @@ class GestureOSApp:
             fps=self.settings.target_fps,
         )
         self._validator = CameraValidator()
-        self._tracking = TrackingModule()
+        # CP-1: pass ModelManager to HandLandmarker per TRD §3.2.
+        # The Hand Landmarker obtains its ML handle from the manager.
+        self._tracking = TrackingModule(model_manager=self._model_manager)
 
         # CP-2 pipeline.
         self._hand_identity = HandIdentityModule()
@@ -142,13 +157,13 @@ class GestureOSApp:
             dominant_hand_mode=self.settings.dominant_hand_mode,
         )
 
-        # CP-3 pipeline.
-        self._gesture_engine = GestureEngine(settings=self.settings)
-        self._conflict_resolver = ConflictResolver()
-        self._stability_filter = StabilityFilter(
-            window_ms=self.settings.gesture_stability_window_ms,
+        # CP-3 pipeline (V2.0: StaticGestureEngine + GestureFuser + GestureGate).
+        self._gesture_engine = StaticGestureEngine(settings=self.settings)
+        self._gesture_fuser = GestureFuser()
+        self._gesture_gate = GestureGate(
+            settings=self.settings,
+            stability_window_ms=self.settings.gesture_stability_window_ms,
         )
-        self._cooldown_filter = CooldownFilter(settings=self.settings)
 
         # CP-4: ActivationGate. Constructed in INACTIVE per FR-AM-06.
         # The hold-duration setting is read once at construction; the
@@ -165,6 +180,50 @@ class GestureOSApp:
         self._overlay: OverlayWindow | None = None
 
         self._capture_thread: CaptureThread | None = None
+
+    # -- Extension registry -------------------------------------------------
+
+    @staticmethod
+    def _populate_extension_registry() -> None:
+        """Register all built-in extension implementations.
+
+        CP-1: the registry is populated once at startup. The
+        implementations registered here are consumed by later
+        checkpoints:
+          - CP-3: MediaPipeGestureEngine + CustomFallbackEngine
+            (GestureRecognizerBase implementations)
+          - CP-5+: WindowsExecutor (ActionExecutorBase) and
+            WindowsContextAdapter (ContextAdapterBase)
+
+        Per RULES §2.10 and AI Development Guide §9.3, every
+        built-in implementation must be registered here. In CP-1
+        only the registration code is present; registration of
+        empty stubs is acceptable until the implementation
+        checkpoint delivers the concrete classes.
+
+        Hot-path note: this runs once at startup, not per frame.
+        """
+        from ext.registry import ExtensionRegistry
+
+        registry = ExtensionRegistry.get_instance()
+
+        # Register GestureRecognizerBase stubs (concrete implementations
+        # arrive in CP-3). The registry tolerates None — callers check
+        # availability via `get()`.
+        registry.register_recognizer(
+            'static_gesture_engine.mediapipe', None,
+        )
+        registry.register_recognizer(
+            'static_gesture_engine.custom_fallback', None,
+        )
+
+        # Register ActionExecutorBase stub (concrete implementation
+        # arrives in CP-5+).
+        registry.register_executor('action_executor.windows', None)
+
+        # Register ContextAdapterBase stub (concrete implementation
+        # arrives in CP-5+).
+        registry.register_context_adapter('context_adapter.windows', None)
 
     # -- Wiring --------------------------------------------------------------
 
@@ -272,6 +331,13 @@ class GestureOSApp:
         # `developer_mode` toggle (Developer Mode diagnostic panel)
         # without needing a separate API call.
         self._overlay = OverlayWindow(settings=self.settings)
+        # CP-1: push ML model status to the overlay badge.
+        _ml_status: str = 'N/A'
+        if self._model_manager.is_gesture_model_available():
+            _ml_status = 'LOADED'
+        elif self._model_manager.is_hand_landmarker_available():
+            _ml_status = 'FALLBACK_ONLY'
+        self._overlay.update_ml_model_status(_ml_status)
         # Push the current activation state into the overlay so the
         # badge starts in the correct color (INACTIVE = grey).
         self._overlay.update_tracking_state(self.activation_gate.state.name)
@@ -287,9 +353,8 @@ class GestureOSApp:
             scale_estimator=self._scale_estimator,
             primary_hand_filter=self._primary_hand_filter,
             gesture_engine=self._gesture_engine,
-            conflict_resolver=self._conflict_resolver,
-            stability_filter=self._stability_filter,
-            cooldown_filter=self._cooldown_filter,
+            gesture_fuser=self._gesture_fuser,
+            gesture_gate=self._gesture_gate,
             activation_gate=self.activation_gate,
         )
         self._wire_capture_signals()
