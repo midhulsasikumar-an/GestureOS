@@ -1,25 +1,23 @@
-"""Unit tests for HandLandmarker (tracking/hand_landmarker.py) — CP-1 + CP-4.
+"""Unit tests for HandLandmarker (tracking/hand_landmarker.py) — CP-1.
 
 Tests cover:
   - MODEL_COMPLEXITY constant is 0 (per user config)
   - HandLandmarker accepts ModelManager for RULES §13.2 compliance (CP-1)
-  - Normal detection path with full handedness metadata
-  - Handedness metadata missing entirely (multi_handedness=None)
-  - Handedness count < landmarks count (partial chirality loss)
-  - Handedness count > landmarks count (unexpected extra)
-  - Malformed hand (<21 landmarks) is still dropped
-  - Status and status_reason fields are populated on every path
-  - Empty frame returns []
+  - Normal detection path with full handedness metadata (Tasks API)
+  - No hand detected returns []
+  - Handedness metadata missing entirely returns []
+  - Handedness count mismatch returns []
+  - Malformed hand (< 21 landmarks) is silently skipped
+  - MediaPipe exception returns [] and auto-reinit path
   - No model_manager logged error (CP-1 graceful degradation)
 
 Per TRD §13.2: no live camera. MediaPipe results are mocked with
-named tuples matching the actual NamedTuple shape MediaPipe returns.
+named tuples matching the Tasks API shape.
 """
 
 from __future__ import annotations
 
 import collections
-from itertools import zip_longest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -30,29 +28,23 @@ from tracking.hand_landmarker import (
     LANDMARKS_PER_HAND,
     MAX_NUM_HANDS,
     MIN_DETECTION_CONFIDENCE,
+    MIN_PRESENCE_CONFIDENCE,
     MIN_TRACKING_CONFIDENCE,
-    MODEL_COMPLEXITY,
-    REASON_HANDEDNESS_MISSING,
-    REASON_MALFORMED_LANDMARKS,
     REINIT_AFTER_CONSECUTIVE_ERRORS,
-    STATUS_ACCEPTED,
-    STATUS_DISCARDED,
     TrackingModule,
 )
 
 
 # ======================================================================
-# Mock helpers
+# Mock helpers — Tasks API shape
 # ======================================================================
 
 _Landmark = collections.namedtuple('Landmark', ['x', 'y', 'z'])
-_HandLandmarks = collections.namedtuple('HandLandmarks', ['landmark'])
-_Classification = collections.namedtuple('Classification', ['label', 'score'])
-_Handedness = collections.namedtuple('Handedness', ['classification'])
+_Classification = collections.namedtuple('Classification', ['category_name', 'score'])
 _Results = collections.namedtuple(
     'Results',
-    ['multi_hand_landmarks', 'multi_handedness', 'multi_hand_world_landmarks'],
-    defaults=(None, None, None),
+    ['hand_landmarks', 'handedness'],
+    defaults=(None, None),
 )
 
 
@@ -61,9 +53,9 @@ def _make_landmarks(count: int = LANDMARKS_PER_HAND) -> list:
     return [_Landmark(0.5, 0.5, 0.0) for _ in range(count)]
 
 
-def _make_handedness(label: str = 'Left', score: float = 0.95) -> _Handedness:
-    """Build a mock handedness entry."""
-    return _Handedness(classification=[_Classification(label=label, score=score)])
+def _make_handedness(category_name: str = 'Left', score: float = 0.95) -> list:
+    """Build a mock handedness entry (list of Classification)."""
+    return [_Classification(category_name=category_name, score=score)]
 
 
 def _make_results(
@@ -72,39 +64,44 @@ def _make_results(
     chirality: str = 'Left',
     confidence: float = 0.95,
     malformed: bool = False,
+    hand_landmarks_none: bool = False,
     handedness_none: bool = False,
 ) -> _Results:
-    """Build a mock MediaPipe results object.
+    """Build a mock Tasks API results object.
 
-    Args:
-        hand_count: number of detected hands (landmark entries).
-        handedness_count: number of handedness entries. None means
-            match hand_count.
-        chirality: chirality label for all handedness entries.
-        confidence: chirality score for all handedness entries.
-        malformed: if True, create entries with a non-21 landmark count.
-        handedness_none: if True, set multi_handedness to None.
+    Tasks API shape:
+        result.hand_landmarks = [list_of_NormalizedLandmark, ...]
+        result.handedness    = [list_of_Classification, ...]
     """
     if handedness_count is None:
         handedness_count = hand_count
 
-    landmarks = []
-    for i in range(hand_count):
-        cnt = 5 if malformed else LANDMARKS_PER_HAND
-        landmarks.append(_HandLandmarks(landmark=_make_landmarks(cnt)))
+    hand_landmarks = None if hand_landmarks_none else [
+        _make_landmarks(5 if malformed else LANDMARKS_PER_HAND)
+        for _ in range(hand_count)
+    ]
 
-    if handedness_none:
-        handedness = None
-    else:
-        handedness = [
-            _make_handedness(label=chirality, score=confidence)
-            for _ in range(handedness_count)
-        ]
+    handedness = None if handedness_none else [
+        _make_handedness(category_name=chirality, score=confidence)
+        for _ in range(handedness_count)
+    ]
 
     return _Results(
-        multi_hand_landmarks=landmarks,
-        multi_handedness=handedness,
+        hand_landmarks=hand_landmarks,
+        handedness=handedness,
     )
+
+
+# ======================================================================
+# Fixture: mock ModelManager
+# ======================================================================
+
+@pytest.fixture
+def mock_mgr() -> MagicMock:
+    """Return a ModelManager mock pre-configured as available."""
+    mgr = MagicMock()
+    mgr.is_hand_landmarker_available.return_value = True
+    return mgr
 
 
 # ======================================================================
@@ -112,25 +109,29 @@ def _make_results(
 # ======================================================================
 
 class TestConstruction:
-    """MODEL_COMPLEXITY must be 0 (per user config)."""
+    """Constants and default construction."""
 
-    def test_model_complexity_is_0(self) -> None:
-        assert MODEL_COMPLEXITY == 0, (
-            f'Expected MODEL_COMPLEXITY=0; got {MODEL_COMPLEXITY}'
-        )
+    def test_model_complexity_removed(self) -> None:
+        """MODEL_COMPLEXITY was removed from the Tasks API implementation.
+        The old constant no longer exists; lite/full accuracy is baked
+        into the .task model bundle."""
+        with pytest.raises(ImportError):
+            from tracking.hand_landmarker import MODEL_COMPLEXITY  # noqa: F401
 
     def test_other_constants_preserved(self) -> None:
         assert MAX_NUM_HANDS == 2
         assert MIN_DETECTION_CONFIDENCE == 0.5
-        assert MIN_TRACKING_CONFIDENCE == 0.4
+        assert MIN_PRESENCE_CONFIDENCE == 0.5
+        assert MIN_TRACKING_CONFIDENCE == 0.5
         assert REINIT_AFTER_CONSECUTIVE_ERRORS == 5
 
     def test_default_construction(self) -> None:
         m = TrackingModule()
         assert m.max_num_hands == MAX_NUM_HANDS
-        assert m.model_complexity == MODEL_COMPLEXITY
         assert m.min_detection_confidence == MIN_DETECTION_CONFIDENCE
+        assert m.min_presence_confidence == MIN_PRESENCE_CONFIDENCE
         assert m.min_tracking_confidence == MIN_TRACKING_CONFIDENCE
+        assert not hasattr(m, 'model_complexity')
 
     def test_construction_with_model_manager(self) -> None:
         mock_mgr = MagicMock()
@@ -146,11 +147,18 @@ class TestConstruction:
 
     def test_initialize_with_mock_model_manager(self) -> None:
         mock_mgr = MagicMock()
-        mock_mgr.get_hand_landmarker.return_value = MagicMock()
+        mock_mgr.is_hand_landmarker_available.return_value = True
         m = TrackingModule(model_manager=mock_mgr)
         with patch('tracking.hand_landmarker.logger') as mock_log:
             m.initialize()
-        assert m._hands is not None
+        # Should forward config to ModelManager.
+        mock_mgr.set_hand_landmarker_config.assert_called_once_with(
+            num_hands=MAX_NUM_HANDS,
+            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_presence_confidence=MIN_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        )
+        assert m._hands is True
         mock_log.info.assert_called_once()
 
 
@@ -161,125 +169,101 @@ class TestConstruction:
 class TestNormalDetection:
     """Full handedness metadata — standard path."""
 
-    def test_single_hand_accepted(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.return_value = _make_results(
-                hand_count=1, handedness_count=1,
-                chirality='Right', confidence=0.88,
-            )
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+    def test_single_hand_accepted(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _make_results(
+            hand_count=1, chirality='Right', confidence=0.88,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert len(out) == 1
         assert out[0].chirality == 'Right'
         assert out[0].confidence == pytest.approx(0.88)
-        assert out[0].status == STATUS_ACCEPTED
-        assert out[0].status_reason is None
 
-    def test_two_hands_both_accepted(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            results = _Results(
-                multi_hand_landmarks=[
-                    _HandLandmarks(landmark=_make_landmarks()),
-                    _HandLandmarks(landmark=_make_landmarks()),
+    def test_two_hands_both_accepted(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _Results(
+            hand_landmarks=[
+                _make_landmarks(),
+                _make_landmarks(),
+            ],
+                handedness=[
+                    _make_handedness(category_name='Left', score=0.91),
+                    _make_handedness(category_name='Right', score=0.87),
                 ],
-                multi_handedness=[
-                    _make_handedness(label='Left', score=0.91),
-                    _make_handedness(label='Right', score=0.87),
-                ],
-            )
-            mock_hands.process.return_value = results
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert len(out) == 2
         assert out[0].chirality == 'Left'
-        assert out[0].status == STATUS_ACCEPTED
         assert out[1].chirality == 'Right'
-        assert out[1].status == STATUS_ACCEPTED
 
-    def test_no_hand_detected_returns_empty(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.return_value = _Results(
-                multi_hand_landmarks=None,
-                multi_handedness=None,
-            )
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+    def test_no_hand_detected_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _Results(
+            hand_landmarks=None,
+            handedness=None,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
+
+    def test_process_returns_none_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = None
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert out == []
 
 
 # ======================================================================
-# Handedness missing paths (CP-4 change)
+# Handedness missing — original behaviour: return []
 # ======================================================================
 
 class TestHandednessMissing:
-    """CP-4: when handedness metadata is missing, hands are emitted with
-    chirality=None and status='discarded'."""
+    """Original behaviour: if either hand_landmarks or handedness
+    is None, the entire frame is dropped (return [])."""
 
-    def test_handedness_none_emits_discarded(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.return_value = _make_results(
-                hand_count=2, handedness_none=True,
-            )
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert len(out) == 2
-        for h in out:
-            assert h.chirality is None
-            assert h.confidence == pytest.approx(0.0)
-            assert h.status == STATUS_DISCARDED
-            assert h.status_reason == REASON_HANDEDNESS_MISSING
+    def test_handedness_none_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _make_results(
+            hand_count=2, handedness_none=True,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
 
-    def test_handedness_partial_missing(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            results = _Results(
-                multi_hand_landmarks=[
-                    _HandLandmarks(landmark=_make_landmarks()),
-                    _HandLandmarks(landmark=_make_landmarks()),
-                ],
-                multi_handedness=[
-                    _make_handedness(label='Left', score=0.95),
-                ],
-            )
-            mock_hands.process.return_value = results
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert len(out) == 2
-        assert out[0].chirality == 'Left'
-        assert out[0].status == STATUS_ACCEPTED
-        assert out[1].chirality is None
-        assert out[1].status == STATUS_DISCARDED
-        assert out[1].status_reason == REASON_HANDEDNESS_MISSING
+    def test_hand_landmarks_none_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _make_results(
+            hand_landmarks_none=True,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
 
-    def test_handedness_more_than_landmarks(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            results = _Results(
-                multi_hand_landmarks=[
-                    _HandLandmarks(landmark=_make_landmarks()),
-                ],
-                multi_handedness=[
-                    _make_handedness(label='Left', score=0.95),
-                    _make_handedness(label='Right', score=0.85),
-                ],
-            )
-            mock_hands.process.return_value = results
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert len(out) == 1
-        assert out[0].chirality == 'Left'
-        assert out[0].status == STATUS_ACCEPTED
+    def test_handedness_partial_missing_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _Results(
+            hand_landmarks=[_make_landmarks(), _make_landmarks()],
+            handedness=[_make_handedness(category_name='Left', score=0.95)],
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
 
-    def test_malformed_hand_is_discarded_with_reason(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.return_value = _make_results(
-                hand_count=1, malformed=True,
-            )
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert len(out) == 1
-        assert out[0].status == STATUS_DISCARDED
-        assert out[0].status_reason == REASON_MALFORMED_LANDMARKS
-        assert out[0].confidence == pytest.approx(0.0)
-        assert out[0].landmarks == []
+    def test_handedness_more_than_landmarks_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _Results(
+            hand_landmarks=[_make_landmarks()],
+            handedness=[
+                _make_handedness(category_name='Left', score=0.95),
+                _make_handedness(category_name='Right', score=0.85),
+            ],
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
+
+    def test_malformed_hand_is_skipped(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.return_value = _make_results(
+            hand_count=1, malformed=True,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
 
 
 # ======================================================================
@@ -290,22 +274,20 @@ class TestMediaPipeException:
     """Existing behaviour preserved: exception returns empty list and
     increments the consecutive-error counter."""
 
-    def test_exception_returns_empty(self) -> None:
-        m = TrackingModule()
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.side_effect = RuntimeError('graph error')
-            out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+    def test_exception_returns_empty(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.side_effect = RuntimeError('graph error')
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert out == []
 
-    def test_consecutive_errors_triggers_reinit(self) -> None:
-        m = TrackingModule(reinit_after_errors=3)
-        with patch.object(m, '_hands') as mock_hands:
-            mock_hands.process.side_effect = RuntimeError('graph error')
-            for _ in range(3):
-                out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-                assert out == []
+    def test_consecutive_errors_triggers_reinit(self, mock_mgr) -> None:
+        mock_mgr.process_hand_landmarker.side_effect = RuntimeError('graph error')
+        m = TrackingModule(model_manager=mock_mgr, reinit_after_errors=3)
+        for _ in range(3):
             out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
             assert out == []
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert out == []
 
 
 # ======================================================================
@@ -313,13 +295,11 @@ class TestMediaPipeException:
 # ======================================================================
 
 class TestStatusConstants:
-    """Pin the status enum strings — they appear in the Developer Mode
-    panel and structured log extras; renaming them is a breaking change."""
-
     def test_status_strings_pinned(self) -> None:
         from tracking.hand_landmarker import (
             REASON_DOMINANT_HAND_MODE,
             REASON_HANDEDNESS_MISSING,
+            REASON_MALFORMED_LANDMARKS,
             REASON_OCCLUSION_BRIDGE,
             STATUS_ACCEPTED,
             STATUS_DISCARDED,

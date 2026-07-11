@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 logger = logging.getLogger('gestureos')
 
@@ -88,6 +90,15 @@ class ModelManager:
         self._gesture_model: object | None = None
         # Auto-reload bookkeeping (TRD §5.2).
         self._consecutive_failures: int = 0
+        # Hand Landmarker configuration (set via set_hand_landmarker_config
+        # or load_hand_landmarker kwargs). Used in VIDEO mode for temporal
+        # tracking across frames.
+        self._hl_num_hands: int = 2
+        self._hl_min_detection_confidence: float = 0.5
+        self._hl_min_presence_confidence: float = 0.5
+        self._hl_min_tracking_confidence: float = 0.5
+        # Monotonically increasing timestamp (ms) for VIDEO mode.
+        self._hl_timestamp_ms: int = 0
 
     # -- Singleton ----------------------------------------------------------
 
@@ -128,6 +139,37 @@ class ModelManager:
     def ensure_model_directory(self) -> None:
         self._models_dir.mkdir(parents=True, exist_ok=True)
 
+    # -- Hand Landmarker configuration --------------------------------------
+
+    def set_hand_landmarker_config(
+        self,
+        num_hands: int | None = None,
+        min_detection_confidence: float | None = None,
+        min_presence_confidence: float | None = None,
+        min_tracking_confidence: float | None = None,
+    ) -> None:
+        """Override the default Hand Landmarker configuration.
+
+        Called by ``HandLandmarker.initialize()`` with the values
+        from the detector instance. The config takes effect on the
+        *next* call to ``load_hand_landmarker()`` (or reload if the
+        model is already loaded and the config differs).
+
+        Args:
+            num_hands: Maximum number of hands to detect (default 2).
+            min_detection_confidence: Min confidence for palm detection.
+            min_presence_confidence: Min confidence for hand presence.
+            min_tracking_confidence: Min IoU threshold for tracking.
+        """
+        if num_hands is not None:
+            self._hl_num_hands = int(num_hands)
+        if min_detection_confidence is not None:
+            self._hl_min_detection_confidence = float(min_detection_confidence)
+        if min_presence_confidence is not None:
+            self._hl_min_presence_confidence = float(min_presence_confidence)
+        if min_tracking_confidence is not None:
+            self._hl_min_tracking_confidence = float(min_tracking_confidence)
+
     # -- Load all -----------------------------------------------------------
 
     def load_all(self) -> None:
@@ -147,6 +189,10 @@ class ModelManager:
 
     def load_hand_landmarker(self) -> bool:
         """Load the MediaPipe Hand Landmarker model file.
+
+        Reads the configuration from ``set_hand_landmarker_config()``
+        (or defaults). The model is created in ``VIDEO`` running mode
+        for temporal tracking across frames.
 
         Returns True on success, False on failure (file missing or
         model load error). On failure, `get_hand_landmarker()`
@@ -178,18 +224,26 @@ class ModelManager:
 
             options = mp.tasks.vision.HandLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=str(model_path)),
-                running_mode=VisionRunningMode.IMAGE,
-                num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_tracking_confidence=0.4,
+                running_mode=VisionRunningMode.VIDEO,
+                num_hands=self._hl_num_hands,
+                min_hand_detection_confidence=self._hl_min_detection_confidence,
+                min_hand_presence_confidence=self._hl_min_presence_confidence,
+                min_tracking_confidence=self._hl_min_tracking_confidence,
             )
             self._hand_landmarker = HandLandmarker.create_from_options(options)
+            # Reset timestamp counter on fresh load.
+            self._hl_timestamp_ms = 0
             logger.info(
                 'ml',
                 extra={'extras': {
                     'event': 'model_loaded',
                     'model': 'hand_landmarker',
                     'path': str(model_path),
+                    'running_mode': 'VIDEO',
+                    'num_hands': self._hl_num_hands,
+                    'min_detection_confidence': self._hl_min_detection_confidence,
+                    'min_presence_confidence': self._hl_min_presence_confidence,
+                    'min_tracking_confidence': self._hl_min_tracking_confidence,
                 }},
             )
             return True
@@ -217,6 +271,51 @@ class ModelManager:
 
     def is_hand_landmarker_available(self) -> bool:
         return self._hand_landmarker is not None
+
+    def process_hand_landmarker(self, frame: np.ndarray) -> Any | None:
+        """Run Hand Landmarker inference on a raw RGB frame.
+
+        Converts the frame to ``mp.Image`` and calls the Tasks API
+        ``.detect_for_video()`` method with a monotonically increasing
+        timestamp (ms). The model must have been loaded in ``VIDEO``
+        running mode.
+
+        This keeps the ``import mediapipe`` confined to ModelManager
+        (RULES §2.9 / §13.2).
+
+        Args:
+            frame: RGB ``np.ndarray`` of shape ``(H, W, 3)``.
+
+        Returns:
+            A ``HandLandmarkerResult`` (Tasks API) with ``hand_landmarks``
+            and ``handedness`` attributes, or ``None`` if the model is
+            unavailable or inference fails.
+        """
+        if self._hand_landmarker is None:
+            return None
+        try:
+            import mediapipe as mp
+
+            # Monotonically increasing timestamp (ms) per VIDEO mode contract.
+            # Using time.monotonic() ensures strict monotonicity even when the
+            # system clock jumps.
+            self._hl_timestamp_ms = max(
+                int(time.monotonic() * 1000),
+                self._hl_timestamp_ms + 1,
+            )
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+            return self._hand_landmarker.detect_for_video(
+                mp_image, self._hl_timestamp_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 — graceful degradation
+            logger.error(
+                'ml',
+                extra={'extras': {
+                    'event': 'hand_landmarker_inference_error',
+                    'error': str(exc),
+                }},
+            )
+            return None
 
     # -- Gesture Recognizer -------------------------------------------------
 

@@ -364,7 +364,7 @@ class GestureOSApp:
         """Stop the capture thread and close the overlay."""
         if self._capture_thread is not None and self._capture_thread.isRunning():
             self._capture_thread.stop()
-            self._capture_thread.wait(timeout=3000)
+            self._capture_thread.wait(3000)
         if self._overlay is not None:
             self._overlay.close()
             self._overlay = None

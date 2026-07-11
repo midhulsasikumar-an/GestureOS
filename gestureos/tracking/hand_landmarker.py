@@ -14,10 +14,11 @@ both names to keep tests and the app from changing every checkpoint.
 RULES §2.4: tracking/ does not import from recognizer, conflict_resolver,
 or executor.
 RULES §2.9: tracking/ does not import mediapipe directly. The
-MediaPipe Hand Landmarker handle is obtained from `ModelManager`.
+MediaPipe Hand Landmarker handle is obtained and invoked through
+`ModelManager`.
 RULES §13.2: the Hand Landmarker is loaded only by `ModelManager`.
-The detector below uses `model_manager.get_hand_landmarker()` to
-obtain the inference handle.
+The detector below uses `model_manager.process_hand_landmarker()` to
+run inference.
 """
 
 from __future__ import annotations
@@ -35,9 +36,9 @@ logger = logging.getLogger('gestureos')
 
 
 MAX_NUM_HANDS: int = 2
-MODEL_COMPLEXITY: int = 0
 MIN_DETECTION_CONFIDENCE: float = 0.5
-MIN_TRACKING_CONFIDENCE: float = 0.4
+MIN_PRESENCE_CONFIDENCE: float = 0.5
+MIN_TRACKING_CONFIDENCE: float = 0.5
 LANDMARKS_PER_HAND: int = 21
 REINIT_AFTER_CONSECUTIVE_ERRORS: int = 5
 
@@ -57,8 +58,8 @@ class HandLandmarker:
 
     CP-1 (per Implementation Plan §5 Task 1.2): the Hand Landmarker
     model handle is owned by `ModelManager`. This class does NOT
-    import `mediapipe`; it calls `model_manager.get_hand_landmarker()`
-    to obtain the inference handle. RULES §13.2 compliance.
+    import `mediapipe`; it calls `model_manager.process_hand_landmarker()`
+    to run inference. RULES §13.2 compliance.
 
     The public name `TrackingModule` is preserved as a backward-
     compatible alias for tests and call sites that were updated in
@@ -70,27 +71,31 @@ class HandLandmarker:
         self,
         model_manager: Any | None = None,
         max_num_hands: int = MAX_NUM_HANDS,
-        model_complexity: int = MODEL_COMPLEXITY,
         min_detection_confidence: float = MIN_DETECTION_CONFIDENCE,
+        min_presence_confidence: float = MIN_PRESENCE_CONFIDENCE,
         min_tracking_confidence: float = MIN_TRACKING_CONFIDENCE,
         reinit_after_errors: int = REINIT_AFTER_CONSECUTIVE_ERRORS,
     ) -> None:
         self.model_manager = model_manager
         self.max_num_hands = max_num_hands
-        self.model_complexity = model_complexity
         self.min_detection_confidence = min_detection_confidence
+        self.min_presence_confidence = min_presence_confidence
         self.min_tracking_confidence = min_tracking_confidence
         self.reinit_after_errors = reinit_after_errors
         self._hands: Any = None
         self._consecutive_errors = 0
 
     def initialize(self) -> None:
-        """Initialize the MediaPipe Hand Landmarker via ModelManager.
+        """Forward configuration to ModelManager and prepare for inference.
 
-        CP-1: the model handle is obtained from `ModelManager`. If
-        the model is not available (e.g., the bundled `.task` file
-        is missing), `initialize()` logs an ERROR and leaves
-        `_hands` as None; subsequent `detect()` calls return [].
+        Calls ``model_manager.set_hand_landmarker_config()`` with the
+        detector's ``max_num_hands`` / ``min_detection_confidence`` /
+        ``min_presence_confidence`` / ``min_tracking_confidence`` values,
+        then ensures the model is loaded in ``VIDEO`` running mode.
+
+        The actual model handle lives in ModelManager; this method
+        only checks availability. Inference is routed through
+        ``model_manager.process_hand_landmarker()``.
         """
         if self.model_manager is None:
             logger.error(
@@ -104,30 +109,50 @@ class HandLandmarker:
             self._hands = None
             return
 
-        landmarker = self.model_manager.get_hand_landmarker()
-        if landmarker is None:
-            logger.error(
-                'tracking',
-                extra={'extras': {
-                    'event': 'hand_landmarker_unavailable',
-                    'hint': 'ModelManager could not provide a Hand '
-                            'Landmarker handle; check assets/models/.',
-                }},
-            )
-            self._hands = None
-            return
+        self._sync_config_to_model_manager()
 
-        self._hands = landmarker
+        if not self.model_manager.is_hand_landmarker_available():
+            # Config has been set; attempt to (re)load so the detector
+            # runs with the correct parameters.
+            if not self.model_manager.load_hand_landmarker():
+                logger.error(
+                    'tracking',
+                    extra={'extras': {
+                        'event': 'hand_landmarker_unavailable',
+                        'hint': 'ModelManager could not provide a Hand '
+                                'Landmarker handle; check assets/models/.',
+                    }},
+                )
+                self._hands = None
+                return
+
+        self._hands = True
         self._consecutive_errors = 0
         logger.info(
             'tracking',
             extra={'extras': {
                 'event': 'mediapipe_initialized',
                 'max_num_hands': self.max_num_hands,
-                'model_complexity': self.model_complexity,
                 'min_detection_confidence': self.min_detection_confidence,
+                'min_presence_confidence': self.min_presence_confidence,
                 'min_tracking_confidence': self.min_tracking_confidence,
             }},
+        )
+
+    def _sync_config_to_model_manager(self) -> None:
+        """Forward this detector's config to ModelManager.
+
+        Called from ``initialize()`` so that ``load_hand_landmarker()``
+        uses the correct ``num_hands``, detection/presence/tracking
+        confidence thresholds instead of hardcoded defaults.
+        """
+        if self.model_manager is None:
+            return
+        self.model_manager.set_hand_landmarker_config(
+            num_hands=self.max_num_hands,
+            min_detection_confidence=self.min_detection_confidence,
+            min_presence_confidence=self.min_presence_confidence,
+            min_tracking_confidence=self.min_tracking_confidence,
         )
 
     def reinitialize(self) -> bool:
@@ -147,27 +172,32 @@ class HandLandmarker:
             return False
 
     def close(self) -> None:
-        """Release MediaPipe resources. Idempotent."""
-        if self._hands is not None:
-            try:
-                close_fn = getattr(self._hands, 'close', None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception:  # noqa: BLE001 — close is best-effort
-                pass
-            self._hands = None
+        """Release HandLandmarker reference. Idempotent.
+
+        The actual MediaPipe handle is owned and released by
+        ModelManager; this method only clears our reference.
+        """
+        self._hands = None
 
     def detect(self, rgb_frame: np.ndarray) -> list[HandData]:
         """Run hand detection on an RGB frame.
 
-        Returns 0–2 `HandData` objects. `role`, `scale`, and
-        `gesture_eligible` are NOT populated at this stage — that is
-        Checkpoint 2's responsibility.
+        Inference is delegated to ``ModelManager.process_hand_landmarker()``
+        which converts the frame to ``mp.Image`` and calls the Tasks API
+        ``.detect_for_video()`` method with a monotonically increasing
+        timestamp (VIDEO running mode for temporal tracking).
 
-        The method is part of the hot-path (TRD §15 / RULES §6.4):
-        it never raises. Internal errors are logged and an empty
-        list is returned; only `TrackingInitError` is allowed to
-        propagate (after the auto-reload path is exhausted).
+        Returns 0–2 `HandData` objects. The old `multi_hand_landmarks` /
+        `multi_handedness` (Solutions API) have been replaced with
+        ``hand_landmarks`` / ``handedness`` (Tasks API). The result
+        shape is equivalent: ``hand_landmarks[i]`` is a list of
+        NormalizedLandmark objects, ``handedness[i]`` is a list of
+        Classification entries.
+
+        Behaviour is preserved from the last working implementation:
+        - If either ``hand_landmarks`` or ``handedness`` is None → []
+        - If lengths differ → []
+        - Malformed hands (< 21 landmarks) → silently skipped
         """
         if self._hands is None:
             self.initialize()
@@ -176,7 +206,7 @@ class HandLandmarker:
             return []
 
         try:
-            results = self._hands.process(rgb_frame)
+            results = self.model_manager.process_hand_landmarker(rgb_frame)
             self._consecutive_errors = 0
         except Exception as exc:  # noqa: BLE001 — error path per TRD §3.2
             self._consecutive_errors += 1
@@ -199,120 +229,57 @@ class HandLandmarker:
                     )
             return []
 
-        if results.multi_hand_landmarks is None:
+        if results is None:
             return []
 
-        handedness_list = results.multi_handedness
-        if handedness_list is None:
-            logger.warning(
-                'tracking',
-                extra={'extras': {
-                    'event': 'mediapipe_hand_count_mismatch',
-                    'reason': REASON_HANDEDNESS_MISSING,
-                    'landmarks_count': len(results.multi_hand_landmarks),
-                    'handedness_count': 0,
-                }},
-            )
-            return [
-                self._build_handdata(
-                    hand_landmarks=lm,
-                    handedness_classification=None,
-                    discarded=REASON_HANDEDNESS_MISSING,
-                )
-                for lm in results.multi_hand_landmarks
-            ]
+        # Tasks API attributes (not the old Solutions API multi_* names).
+        hand_landmarks = getattr(results, 'hand_landmarks', None)
+        handedness = getattr(results, 'handedness', None)
 
-        if len(results.multi_hand_landmarks) != len(handedness_list):
+        # Original combined check: if either is missing, drop the frame.
+        if hand_landmarks is None or handedness is None:
+            return []
+
+        # Original behaviour: mismatched counts → return [].
+        if len(hand_landmarks) != len(handedness):
             logger.warning(
                 'tracking',
                 extra={'extras': {
                     'event': 'mediapipe_hand_count_mismatch',
-                    'landmarks_count': len(results.multi_hand_landmarks),
-                    'handedness_count': len(handedness_list),
+                    'landmarks_count': len(hand_landmarks),
+                    'handedness_count': len(handedness),
                 }},
             )
-            out: list[HandData] = []
-            n = min(len(results.multi_hand_landmarks), len(handedness_list))
-            for i in range(n):
-                out.append(
-                    self._build_handdata(
-                        hand_landmarks=results.multi_hand_landmarks[i],
-                        handedness_classification=(
-                            handedness_list[i].classification[0]
-                        ),
-                        discarded=None,
-                    )
-                )
-            for i in range(n, len(results.multi_hand_landmarks)):
-                out.append(
-                    self._build_handdata(
-                        hand_landmarks=results.multi_hand_landmarks[i],
-                        handedness_classification=None,
-                        discarded=REASON_HANDEDNESS_MISSING,
-                    )
-                )
-            return out
+            return []
 
         out: list[HandData] = []
-        for hand_landmarks, handedness in zip(
-            results.multi_hand_landmarks, handedness_list
-        ):
+        for hl, hd in zip(hand_landmarks, handedness):
+            # Skip malformed hands (original behaviour).
+            if len(hl) != LANDMARKS_PER_HAND:
+                logger.warning(
+                    'tracking',
+                    extra={'extras': {
+                        'event': 'malformed_hand_discarded',
+                        'landmark_count': len(hl),
+                    }},
+                )
+                continue
+
+            landmarks: list[tuple[float, float, float]] = [
+                (lm.x, lm.y, lm.z) for lm in hl
+            ]
+            chirality = hd[0].category_name
+            confidence = float(hd[0].score)
+
             out.append(
-                self._build_handdata(
-                    hand_landmarks=hand_landmarks,
-                    handedness_classification=handedness.classification[0],
-                    discarded=None,
+                HandData(
+                    landmarks=landmarks,
+                    chirality=chirality,
+                    confidence=confidence,
                 )
             )
-        return out
 
-    def _build_handdata(
-        self,
-        hand_landmarks: Any,
-        handedness_classification: Any | None,
-        discarded: str | None,
-    ) -> HandData:
-        if len(hand_landmarks.landmark) != LANDMARKS_PER_HAND:
-            logger.warning(
-                'tracking',
-                extra={'extras': {
-                    'event': 'malformed_hand_discarded',
-                    'landmark_count': len(hand_landmarks.landmark),
-                }},
-            )
-            if discarded is None:
-                discarded = REASON_MALFORMED_LANDMARKS
-            return HandData(
-                landmarks=[],
-                chirality=None,
-                confidence=0.0,
-                status=STATUS_DISCARDED,
-                status_reason=discarded,
-            )
-        landmarks: list[tuple[float, float, float]] = [
-            (lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark
-        ]
-        if handedness_classification is None:
-            chirality: str | None = None
-            confidence = 0.0
-        else:
-            chirality = handedness_classification.label
-            confidence = float(handedness_classification.score)
-        if discarded is not None:
-            return HandData(
-                landmarks=landmarks,
-                chirality=chirality,
-                confidence=confidence,
-                status=STATUS_DISCARDED,
-                status_reason=discarded,
-            )
-        return HandData(
-            landmarks=landmarks,
-            chirality=chirality,
-            confidence=confidence,
-            status=STATUS_ACCEPTED,
-            status_reason=None,
-        )
+        return out
 
 
 # Backward-compatible alias. CP-0 migrated call sites from
@@ -320,4 +287,3 @@ class HandLandmarker:
 # intermediate). CP-1 introduces the canonical `HandLandmarker`
 # name; both names point to the same class for the rest of V1.
 TrackingModule = HandLandmarker
-

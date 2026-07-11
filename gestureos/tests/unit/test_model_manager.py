@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from models.model_manager import (
@@ -140,6 +141,13 @@ class TestHandLandmarkerLoad:
             assert result is True
             assert mgr.get_hand_landmarker() is not None
             assert mgr.is_hand_landmarker_available() is True
+            # Verify VIDEO mode and all confidence params are passed.
+            call_options = fake_mp.tasks.vision.HandLandmarkerOptions.call_args[1]
+            assert call_options['running_mode'] == fake_mp.tasks.vision.RunningMode.VIDEO
+            assert call_options['num_hands'] == 2
+            assert call_options['min_hand_detection_confidence'] == 0.5
+            assert call_options['min_hand_presence_confidence'] == 0.5
+            assert call_options['min_tracking_confidence'] == 0.5
 
     @patch('models.model_manager.Path.exists', return_value=True)
     def test_load_failure_returns_none(self, mock_exists, mgr) -> None:
@@ -148,6 +156,26 @@ class TestHandLandmarkerLoad:
             result = mgr.load_hand_landmarker()
             assert result is False
             assert mgr.get_hand_landmarker() is None
+
+
+    @patch('models.model_manager.Path.exists', return_value=True)
+    def test_load_respects_config(self, mock_exists, mgr) -> None:
+        """load_hand_landmarker reads config set by set_hand_landmarker_config."""
+        mgr.set_hand_landmarker_config(
+            num_hands=1,
+            min_detection_confidence=0.3,
+            min_presence_confidence=0.4,
+            min_tracking_confidence=0.6,
+        )
+        with mock_mediapipe() as fake_mp:
+            fake_mp.tasks.vision.HandLandmarkerOptions.return_value = MagicMock()
+            fake_mp.tasks.vision.HandLandmarker.create_from_options.return_value = MagicMock()
+            mgr.load_hand_landmarker()
+            call_options = fake_mp.tasks.vision.HandLandmarkerOptions.call_args[1]
+            assert call_options['num_hands'] == 1
+            assert call_options['min_hand_detection_confidence'] == 0.3
+            assert call_options['min_hand_presence_confidence'] == 0.4
+            assert call_options['min_tracking_confidence'] == 0.6
 
 
 # ======================================================================
@@ -310,6 +338,107 @@ class TestShutdown:
                 assert mgr.is_hand_landmarker_available() is False
                 assert mgr.is_gesture_model_available() is False
                 assert mgr.consecutive_failures == 0
+
+
+# ======================================================================
+# process_hand_landmarker
+# ======================================================================
+
+class TestProcessHandLandmarker:
+    """Tests for ModelManager.process_hand_landmarker()."""
+
+    def test_returns_none_when_not_loaded(self, mgr) -> None:
+        result = mgr.process_hand_landmarker(
+            np.zeros((480, 640, 3), dtype=np.uint8)
+        )
+        assert result is None
+
+    @patch('models.model_manager.Path.exists', return_value=True)
+    def test_returns_result_when_loaded(self, mock_exists, mgr) -> None:
+        with mock_mediapipe() as fake_mp:
+            fake_mp.tasks.vision.HandLandmarkerOptions.return_value = MagicMock()
+            mock_detector = MagicMock(name='hand_landmarker')
+            fake_mp.tasks.vision.HandLandmarker.create_from_options.return_value = (
+                mock_detector
+            )
+            mgr.load_hand_landmarker()
+
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            expected_result = object()
+            mock_detector.detect_for_video.return_value = expected_result
+
+            result = mgr.process_hand_landmarker(frame)
+            assert result is expected_result
+            # Verify mp.Image was created and passed to detect_for_video()
+            # with a timestamp (int).
+            args, _ = mock_detector.detect_for_video.call_args
+            assert args is not None
+            assert len(args) == 2
+            # First arg is mp.Image mock, second is int timestamp.
+            assert isinstance(args[1], int)
+            mock_detector.detect_for_video.assert_called_once()
+
+    @patch('models.model_manager.Path.exists', return_value=True)
+    def test_inference_error_returns_none(self, mock_exists, mgr) -> None:
+        with mock_mediapipe() as fake_mp:
+            fake_mp.tasks.vision.HandLandmarkerOptions.return_value = MagicMock()
+            mock_detector = MagicMock(name='hand_landmarker')
+            fake_mp.tasks.vision.HandLandmarker.create_from_options.return_value = (
+                mock_detector
+            )
+            mgr.load_hand_landmarker()
+
+            mock_detector.detect_for_video.side_effect = RuntimeError('inference failed')
+            result = mgr.process_hand_landmarker(
+                np.zeros((480, 640, 3), dtype=np.uint8)
+            )
+            assert result is None
+
+    @patch('models.model_manager.Path.exists', return_value=True)
+    def test_timestamp_monotonically_increasing(self, mock_exists, mgr) -> None:
+        """Timestamps passed to detect_for_video must be strictly increasing."""
+        with mock_mediapipe() as fake_mp:
+            fake_mp.tasks.vision.HandLandmarkerOptions.return_value = MagicMock()
+            mock_detector = MagicMock(name='hand_landmarker')
+            fake_mp.tasks.vision.HandLandmarker.create_from_options.return_value = (
+                mock_detector
+            )
+            mock_detector.detect_for_video.return_value = object()
+            mgr.load_hand_landmarker()
+
+            timestamps: list[int] = []
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            for _ in range(10):
+                mgr.process_hand_landmarker(frame)
+                call_args = mock_detector.detect_for_video.call_args[0]
+                timestamps.append(call_args[1])
+
+            # Every timestamp must be strictly greater than the previous.
+            for i in range(1, len(timestamps)):
+                assert timestamps[i] > timestamps[i - 1], (
+                    f'Timestamp at frame {i} ({timestamps[i]}) is not > '
+                    f'frame {i - 1} ({timestamps[i - 1]})'
+                )
+
+    @patch('models.model_manager.Path.exists', return_value=True)
+    def test_timestamp_reset_on_reload(self, mock_exists, mgr) -> None:
+        """Timestamp counter resets after a fresh load_hand_landmarker."""
+        with mock_mediapipe() as fake_mp:
+            fake_mp.tasks.vision.HandLandmarkerOptions.return_value = MagicMock()
+            mock_detector = MagicMock(name='hand_landmarker')
+            fake_mp.tasks.vision.HandLandmarker.create_from_options.return_value = (
+                mock_detector
+            )
+            mock_detector.detect_for_video.return_value = object()
+            mgr.load_hand_landmarker()
+
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            mgr.process_hand_landmarker(frame)
+            ts_before = mgr._hl_timestamp_ms
+
+            # Simulate a reload.
+            mgr.load_hand_landmarker()
+            assert mgr._hl_timestamp_ms == 0
 
 
 # ======================================================================
