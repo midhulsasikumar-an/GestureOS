@@ -236,25 +236,51 @@ class HandLandmarker:
         hand_landmarks = getattr(results, 'hand_landmarks', None)
         handedness = getattr(results, 'handedness', None)
 
-        # Original combined check: if either is missing, drop the frame.
-        if hand_landmarks is None or handedness is None:
+        # CP-2 (Tracking Stabilization): when landmarks are present
+        # but handedness metadata is missing or length-mismatched, do
+        # NOT discard the entire frame (the V1.x behaviour was to
+        # `return []`, which produced intermittent "tracked one frame,
+        # gone the next" perception). Instead, iterate over the
+        # landmarks list and emit each hand with `chirality=None` and
+        # `confidence=0.0` so the downstream analysis stages
+        # (HandIdentityModule, HandScaleEstimator, PrimaryHandFilter)
+        # can still process the frame. The event is logged at WARN
+        # with the per-list counts so future debugging can attribute
+        # the loss to MediaPipe's metadata path rather than to a
+        # missing hand.
+        if hand_landmarks is None:
+            # Genuine no-hand case: nothing to emit.
             return []
 
-        # Original behaviour: mismatched counts → return [].
-        if len(hand_landmarks) != len(handedness):
+        n_landmarks = len(hand_landmarks)
+        n_handedness = len(handedness) if handedness is not None else 0
+
+        if handedness is None or n_handedness != n_landmarks:
             logger.warning(
                 'tracking',
                 extra={'extras': {
                     'event': 'mediapipe_hand_count_mismatch',
-                    'landmarks_count': len(hand_landmarks),
-                    'handedness_count': len(handedness),
+                    'landmarks_count': n_landmarks,
+                    'handedness_count': n_handedness,
+                    'chirality_will_be': 'None',
                 }},
             )
-            return []
+            # Build a fallback handedness list of the same length as
+            # `hand_landmarks` so the per-hand pass can iterate
+            # uniformly. Each entry is `(None, 0.0)` — see loop body.
+            handedness_iter: list[tuple[str | None, float]] = [
+                (None, 0.0)
+            ] * n_landmarks
+        else:
+            handedness_iter = [
+                (hd[0].category_name, float(hd[0].score))
+                for hd in handedness
+            ]
 
         out: list[HandData] = []
-        for hl, hd in zip(hand_landmarks, handedness):
-            # Skip malformed hands (original behaviour).
+        for hl, (chirality, confidence) in zip(hand_landmarks, handedness_iter):
+            # Skip malformed hands (preserved V1.x behaviour: emit nothing
+            # for hands with ≠21 landmarks).
             if len(hl) != LANDMARKS_PER_HAND:
                 logger.warning(
                     'tracking',
@@ -268,14 +294,28 @@ class HandLandmarker:
             landmarks: list[tuple[float, float, float]] = [
                 (lm.x, lm.y, lm.z) for lm in hl
             ]
-            chirality = hd[0].category_name
-            confidence = float(hd[0].score)
 
+            # CP-2 (Tracking Stabilization): populate the per-hand
+            # `status` / `status_reason` / `tracking_confidence` fields
+            # on every emitted hand.  `tracking_confidence` is left as
+            # `None` because MediaPipe 0.10.14's Tasks API does not
+            # surface a separate per-hand tracking score (the
+            # `handedness[i][0].score` is the only score returned and
+            # it carries presence + handedness combined). The
+            # `status`/`status_reason` fields are populated here
+            # (`accepted`) and may be overwritten by downstream
+            # analysis stages (OcclusionHandler, PrimaryHandFilter).
+            # `chirality` may legitimately be `None` (handedness-
+            # missing path); `confidence` is `0.0` in that case to
+            # reflect the absence of a real score.
             out.append(
                 HandData(
                     landmarks=landmarks,
-                    chirality=chirality,
+                    chirality=chirality,  # 'Left' | 'Right' | None (handedness-missing path)
                     confidence=confidence,
+                    tracking_confidence=None,
+                    status=STATUS_ACCEPTED,
+                    status_reason=None,
                 )
             )
 

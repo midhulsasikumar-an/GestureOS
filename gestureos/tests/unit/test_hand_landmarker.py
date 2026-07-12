@@ -211,24 +211,37 @@ class TestNormalDetection:
         out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert out == []
 
-
-# ======================================================================
-# Handedness missing — original behaviour: return []
-# ======================================================================
-
-class TestHandednessMissing:
-    """Original behaviour: if either hand_landmarks or handedness
-    is None, the entire frame is dropped (return [])."""
-
-    def test_handedness_none_returns_empty(self, mock_mgr) -> None:
+    def test_per_hand_status_fields_populated(self, mock_mgr) -> None:
+        """CP-2 (Tracking Stabilisation): every emitted hand carries
+        `status='accepted'`, `status_reason=None`, and
+        `tracking_confidence=None` (MediaPipe 0.10.14 does not surface
+        a separate tracking score)."""
         mock_mgr.process_hand_landmarker.return_value = _make_results(
-            hand_count=2, handedness_none=True,
+            hand_count=2,
+            chirality='Left', confidence=0.91,
         )
         m = TrackingModule(model_manager=mock_mgr)
         out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert out == []
+        assert len(out) == 2
+        for hand in out:
+            assert hand.status == 'accepted'
+            assert hand.status_reason is None
+            assert hand.tracking_confidence is None
+
+
+# ======================================================================
+# Handedness missing — CP-2 Tracking Stabilisation: per-hand emission
+# ======================================================================
+
+class TestHandednessMissing:
+    """CP-2 (Tracking Stabilisation): when handedness metadata is
+    missing or count-mismatched, emit each hand with `chirality=None`
+    and `confidence=0.0` instead of dropping the entire frame.
+    This prevents the intermittent "tracked one frame, gone the next"
+    perception that the V1.x whole-frame discard produced."""
 
     def test_hand_landmarks_none_returns_empty(self, mock_mgr) -> None:
+        """hand_landmarks=None is still a genuine no-hand frame."""
         mock_mgr.process_hand_landmarker.return_value = _make_results(
             hand_landmarks_none=True,
         )
@@ -236,16 +249,41 @@ class TestHandednessMissing:
         out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
         assert out == []
 
-    def test_handedness_partial_missing_returns_empty(self, mock_mgr) -> None:
+    def test_handedness_none_emits_hands_with_chirality_none(self, mock_mgr) -> None:
+        """handedness=None with valid landmarks → emit hands with
+        chirality=None, confidence=0.0, status='accepted'."""
+        mock_mgr.process_hand_landmarker.return_value = _make_results(
+            hand_count=2, handedness_none=True,
+        )
+        m = TrackingModule(model_manager=mock_mgr)
+        out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+        assert len(out) == 2
+        for hand in out:
+            assert hand.chirality is None
+            assert hand.confidence == pytest.approx(0.0)
+            assert hand.tracking_confidence is None
+            assert hand.status == 'accepted'
+            assert hand.status_reason is None
+
+    def test_handedness_partial_missing_emits_all_hands(self, mock_mgr) -> None:
+        """2 landmarks with 1 handedness entry → 2 hands with
+        chirality=None, 0.0 confidence."""
         mock_mgr.process_hand_landmarker.return_value = _Results(
             hand_landmarks=[_make_landmarks(), _make_landmarks()],
             handedness=[_make_handedness(category_name='Left', score=0.95)],
         )
         m = TrackingModule(model_manager=mock_mgr)
         out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert out == []
+        assert len(out) == 2
+        for hand in out:
+            assert hand.chirality is None
+            assert hand.confidence == pytest.approx(0.0)
+            assert hand.status == 'accepted'
 
-    def test_handedness_more_than_landmarks_returns_empty(self, mock_mgr) -> None:
+    def test_handedness_more_than_landmarks(self, mock_mgr) -> None:
+        """1 landmark with 2 handedness entries → 1 hand with
+        chirality=None, confidence=0.0 (the extra handedness entries
+        are ignored; we iterate the shorter landmarks list)."""
         mock_mgr.process_hand_landmarker.return_value = _Results(
             hand_landmarks=[_make_landmarks()],
             handedness=[
@@ -255,9 +293,13 @@ class TestHandednessMissing:
         )
         m = TrackingModule(model_manager=mock_mgr)
         out = m.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
-        assert out == []
+        assert len(out) == 1
+        assert out[0].chirality is None
+        assert out[0].confidence == pytest.approx(0.0)
 
     def test_malformed_hand_is_skipped(self, mock_mgr) -> None:
+        """Malformed hand (<21 landmarks) still silently skipped
+        regardless of handedness state."""
         mock_mgr.process_hand_landmarker.return_value = _make_results(
             hand_count=1, malformed=True,
         )

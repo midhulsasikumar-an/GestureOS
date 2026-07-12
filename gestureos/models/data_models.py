@@ -44,7 +44,7 @@ class HandData:
     tracking_confidence, status, status_reason).
     """
     landmarks: list[tuple[float, float, float]]   # 21 (x, y, z), normalized
-    chirality: str                                  # 'Left' | 'Right' | None
+    chirality: str | None                           # 'Left' | 'Right' | None (handedness-missing path)
     confidence: float
     role: str | None = None                         # 'HAND_A' | 'HAND_B'
     scale: HandScale | None = None                   # NEW v1.2 — populated by HandScaleEstimator

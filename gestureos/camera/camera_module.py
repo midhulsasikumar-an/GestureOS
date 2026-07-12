@@ -43,16 +43,22 @@ RECONNECT_INTERVAL_S: float = 2.0
 class CameraModule:
     """Owns the camera device lifecycle and yields preprocessed BGR frames.
 
+    The returned frame is **unflipped** (natural camera orientation).
+    Mirroring for the webcam preview is applied exclusively in the
+    overlay layer (``overlay_window.py:_repaint``) so that MediaPipe
+    inference receives a geometrically correct image and handedness
+    labels are anatomically correct.
+
     Responsibilities (TRD §3.1):
       - open/configure the device (index, target resolution, target FPS)
-      - read frames and apply flip + resize preprocessing
+      - read frames and apply resize preprocessing
       - detect disconnection and attempt reconnect (10 attempts, 2s interval)
       - on hard failure, raise `CameraUnavailableError`; the caller keeps
         the application running
 
     Outputs:
-      np.ndarray shape (height, width, 3), BGR, flipped (mirror), resized
-      to the configured width × height.
+      np.ndarray shape (height, width, 3), BGR, unflipped (natural camera
+      orientation), resized to the configured width × height.
 
     Error handling:
       - `cv2.VideoCapture` fails to open → CameraUnavailableError
@@ -125,7 +131,12 @@ class CameraModule:
         )
 
     def read_frame(self) -> np.ndarray | None:
-        """Read one frame and apply flip+resize. Returns None on dropped frame.
+        """Read one frame and apply resize. Returns None on dropped frame.
+
+        The returned frame is **not** mirrored — horizontal mirroring for
+        the webcam preview is handled exclusively by the overlay layer
+        (``overlay_window.py:_repaint``) so that MediaPipe inference
+        receives an anatomically correct image.
 
         A None return signals a transient drop — callers should NOT treat
         this as a fatal error.  Only after the 10-attempt reconnect policy
@@ -145,7 +156,6 @@ class CameraModule:
             return None
 
         self.consecutive_drops = 0
-        frame = cv2.flip(frame, 1)  # mirror
         # Skip resize when the driver already returned our target shape.
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height))

@@ -253,9 +253,13 @@ class OverlayWindow(QWidget):
         if self._latest_frame is None:
             return
         frame = self._latest_frame.copy()
+        # Mirror the frame for a natural webcam selfie preview.  The
+        # original (unmirrored) capture is used for MediaPipe inference
+        # so that handedness labels are anatomically correct.
+        frame = cv2.flip(frame, 1)
         from overlay.skeleton_renderer import render_skeleton
 
-        frame = render_skeleton(frame, self._latest_hands)
+        frame = render_skeleton(frame, self._latest_hands, mirror=True)
         frame = _draw_status(
             frame,
             self._latest_fps,

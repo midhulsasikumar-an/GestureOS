@@ -181,8 +181,112 @@ class TestClear:
 
 
 # ======================================================================
-# Read-only introspection
+# get_window — CP-2 (Tracking Stabilisation), TRD §3.7
 # ======================================================================
+
+class TestGetWindow:
+    """Time-windowed query (TRD §3.7 MotionHistoryService.get_window)."""
+
+    def test_empty_role_returns_empty(self) -> None:
+        buf = MotionHistoryService()
+        assert buf.get_window('HAND_A', 200) == []
+
+    def test_unknown_role_returns_empty(self) -> None:
+        buf = MotionHistoryService()
+        assert buf.get_window('NEVER_SEEN', 200) == []
+
+    def test_negative_duration_returns_empty(self) -> None:
+        buf = MotionHistoryService()
+        buf.update('HAND_A', (0.5, 0.5), now=0.0)
+        assert buf.get_window('HAND_A', -1) == []
+
+    def test_zero_duration_returns_most_recent(self) -> None:
+        buf = MotionHistoryService()
+        buf.update('HAND_A', (0.3, 0.4), now=0.0)
+        buf.update('HAND_A', (0.5, 0.6), now=0.1)
+        window = buf.get_window('HAND_A', 0)
+        assert len(window) == 1
+        assert window[0][0] == pytest.approx(0.5)
+
+    def test_wide_window_returns_all_samples(self) -> None:
+        buf = MotionHistoryService(max_frames=10)
+        for i in range(5):
+            buf.update('HAND_A', (float(i) / 10, 0.5), now=i / 30.0)
+        # 5 samples spanning ~133ms (4/30 = 0.133s). A 500ms window
+        # should return all 5.
+        window = buf.get_window('HAND_A', 500)
+        assert len(window) == 5
+
+    def test_narrow_window_returns_subset(self) -> None:
+        buf = MotionHistoryService(max_frames=10)
+        # Push samples with increasing timestamps.
+        for i in range(6):
+            buf.update('HAND_A', (float(i) / 10, 0.5), now=i / 30.0)
+        # 6 samples over 167ms (5/30 = 0.167s). A 50ms window from
+        # the most recent (0.167s) should include only the last 1–2
+        # samples.
+        window = buf.get_window('HAND_A', 50)
+        assert 1 <= len(window) <= 2
+        # The most recent sample's x should be 0.5 (i=5).
+        assert window[-1][0] == pytest.approx(0.5)
+
+    def test_window_is_deterministic(self) -> None:
+        """Same buffer + same duration → same result regardless
+        of when the caller invokes the method (window is measured
+        against the buffer's most-recent sample, not time.time())."""
+        buf = MotionHistoryService(max_frames=10)
+        for i in range(4):
+            buf.update('HAND_A', (float(i) / 10, 0.5), now=i / 30.0)
+        r1 = buf.get_window('HAND_A', 80)
+        r2 = buf.get_window('HAND_A', 80)
+        assert r1 == r2
+
+
+# ======================================================================
+# get_hold_duration — CP-2 (Tracking Stabilisation), TRD §3.7
+# ======================================================================
+
+class TestGetHoldDuration:
+    """Time-since-first-sample (TRD §3.7 MotionHistoryService.get_hold_duration)."""
+
+    def test_empty_role_returns_zero(self) -> None:
+        buf = MotionHistoryService()
+        assert buf.get_hold_duration('HAND_A') == pytest.approx(0.0)
+
+    def test_unknown_role_returns_zero(self) -> None:
+        buf = MotionHistoryService()
+        assert buf.get_hold_duration('NEVER_SEEN') == pytest.approx(0.0)
+
+    def test_single_sample_returns_zero(self) -> None:
+        buf = MotionHistoryService()
+        buf.update('HAND_A', (0.5, 0.5), now=1.0)
+        assert buf.get_hold_duration('HAND_A') == pytest.approx(0.0)
+
+    def test_two_samples_returns_delta(self) -> None:
+        buf = MotionHistoryService()
+        buf.update('HAND_A', (0.5, 0.5), now=1.0)
+        buf.update('HAND_A', (0.6, 0.6), now=1.5)
+        # Duration = 1.5 - 1.0 = 0.5 seconds
+        assert buf.get_hold_duration('HAND_A') == pytest.approx(0.5)
+
+    def test_multiple_samples_longer_duration(self) -> None:
+        buf = MotionHistoryService(max_frames=10)
+        buf.update('HAND_A', (0.5, 0.5), now=0.0)
+        buf.update('HAND_A', (0.6, 0.6), now=0.2)
+        buf.update('HAND_A', (0.7, 0.7), now=0.5)
+        buf.update('HAND_A', (0.8, 0.8), now=1.0)
+        # Duration = 1.0 - 0.0 = 1.0 second
+        assert buf.get_hold_duration('HAND_A') == pytest.approx(1.0)
+
+    def test_per_role_independence(self) -> None:
+        buf = MotionHistoryService()
+        buf.update('HAND_A', (0.5, 0.5), now=0.0)
+        buf.update('HAND_B', (0.9, 0.9), now=2.0)
+        buf.update('HAND_A', (0.6, 0.6), now=3.0)
+        # HAND_A duration = 3.0 - 0.0 = 3.0 seconds
+        # HAND_B duration = 2.0 - 2.0 = 0.0 seconds (single sample)
+        assert buf.get_hold_duration('HAND_A') == pytest.approx(3.0)
+        assert buf.get_hold_duration('HAND_B') == pytest.approx(0.0)
 
 class TestIntrospection:
     def test_get_returns_fresh_copy(self) -> None:
