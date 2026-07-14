@@ -158,7 +158,10 @@ class GestureOSApp:
         )
 
         # CP-3 pipeline (V2.0: StaticGestureEngine + GestureFuser + GestureGate).
-        self._gesture_engine = StaticGestureEngine(settings=self.settings)
+        self._gesture_engine = StaticGestureEngine(
+            settings=self.settings,
+            model_manager=self._model_manager,
+        )
         self._gesture_fuser = GestureFuser()
         self._gesture_gate = GestureGate(
             settings=self.settings,

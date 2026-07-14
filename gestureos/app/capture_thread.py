@@ -641,6 +641,8 @@ class CaptureThread(QThread):
         # shown as "candidates" in the debug panel. When multiple
         # candidates exist for the same role, join them with " | ".
         gesture_candidates: dict[str, str] = {}
+        # Candidate detail for source/confidence display.
+        candidate_detail: dict[str, list[tuple[str, str, float]]] = {}
         for c in candidates:
             if not c.gesture_name:
                 continue
@@ -649,6 +651,10 @@ class CaptureThread(QThread):
                 gesture_candidates[c.hand_role] = f"{existing} | {c.gesture_name}"
             else:
                 gesture_candidates[c.hand_role] = c.gesture_name
+            source = c.source if c.source else 'custom'
+            candidate_detail.setdefault(c.hand_role, []).append(
+                (c.gesture_name, source, c.confidence)
+            )
 
         return SimpleNamespace(
             gesture_candidates=gesture_candidates or None,
@@ -656,6 +662,7 @@ class CaptureThread(QThread):
             final_gesture_confidence=final_gesture_confidence or None,
             stability_status=stability_status or None,
             cooldown_status=cooldown_status or None,
+            candidate_detail=candidate_detail or None,
             activation_state=(
                 self._activation_gate.state.name
                 if self._activation_gate is not None

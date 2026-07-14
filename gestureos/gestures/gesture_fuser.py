@@ -10,6 +10,14 @@ candidates for the same hand role to a single winner using:
   - FR-CR-02: highest-confidence wins
   - FR-CR-03: fixed-priority tie-break
   - FR-CR-04: operates independently per hand role
+
+CP-3 Gesture Fusion Priority (TRD §3.9.2):
+  - MediaPipe results with confidence ≥ MEDIAPIPE_WIN_CONFIDENCE win
+    unconditionally over custom recognizers for that role.
+  - MediaPipe results below the threshold are removed from
+    consideration (custom recognizers compete instead).
+  - Same-gesture duplicates are eliminated (MP survives when
+    confident, is removed otherwise).
 """
 
 from __future__ import annotations
@@ -22,6 +30,13 @@ from models.data_models import GestureResult
 
 logger = logging.getLogger('gestureos')
 
+
+#: CP-3 Gesture Fusion Priority: confidence threshold at which a
+#: MediaPipe Gesture Recognizer candidate wins unconditionally over
+#: all custom geometric recognizers for the same hand role.
+#: Below this threshold the MediaPipe candidate is removed and custom
+#: recognizers compete normally (TRD §3.9.2).
+MEDIAPIPE_WIN_CONFIDENCE: float = 0.80
 
 GESTURE_TIE_BREAK_PRIORITY: dict[str, int] = {
     'pinch': 0,
@@ -46,6 +61,9 @@ class GestureFuser:
 
     V2.0 rename of ConflictResolver. Stateless: the fuser holds no
     per-frame state.
+
+    CP-3: ``_resolve_one_role()`` applies the MediaPipe Fusion Priority
+    rules before falling back to confidence + tie-break.
     """
 
     def resolve(
@@ -94,6 +112,34 @@ class GestureFuser:
         role: str,
         role_candidates: list[GestureResult],
     ) -> GestureResult:
+        # CP-3 Gesture Fusion Priority (TRD §3.9.2):
+        # ---------------------------------------------------------------
+        # 1. If a MediaPipe candidate has confidence >=
+        #    MEDIAPIPE_WIN_CONFIDENCE (0.80), it wins unconditionally
+        #    over all custom candidates for this role.
+        # 2. If MediaPipe exists but confidence < threshold, remove
+        #    the MediaPipe candidate from consideration and let the
+        #    custom recognizers compete among themselves.
+        # 3. If no custom candidates remain after removal, return the
+        #    MediaPipe result as a fallback.
+        mp_candidates = [
+            c for c in role_candidates
+            if getattr(c, 'source', '') == 'mediapipe'
+        ]
+        if mp_candidates:
+            mp = mp_candidates[0]
+            if mp.confidence >= MEDIAPIPE_WIN_CONFIDENCE:
+                return mp
+            # Low-confidence MP: remove from consideration.
+            remaining = [
+                c for c in role_candidates
+                if c.source != 'mediapipe'
+            ]
+            if not remaining:
+                return mp  # fallback
+            role_candidates = remaining
+
+        # Original resolution among (custom-only) candidates.
         if len(role_candidates) == 1:
             return role_candidates[0]
         max_confidence = max(c.confidence for c in role_candidates)

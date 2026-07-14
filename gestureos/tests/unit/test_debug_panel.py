@@ -170,6 +170,10 @@ class TestRenderSmoke:
             final_gesture_confidence={'HAND_A': 0.87},
             stability_status={'HAND_A': 'PASSED (210ms)'},
             cooldown_status={'HAND_A': 'READY'},
+            candidate_detail={
+                'HAND_A': [('pinch', 'custom', 0.87),
+                            ('open_palm', 'custom', 0.65)]
+            },
         )
         out = render_debug_panel(
             frame, [hand], fps=29.5, gesture_state=state,
@@ -248,13 +252,15 @@ class TestPalmOrientation:
 
 
 class TestFingerStatesFormat:
-    """Finger-state string is derived via gestures.finger_states()."""
+    """Finger-state string is derived via gestures.finger_states()
+    and gestures.is_thumb_extended() for the thumb."""
 
     def test_open_palm_all_extended(self) -> None:
         from overlay.debug_panel import _format_finger_states
         landmarks = load_fixture('sample_landmarks.json')['open_palm_right']
         hand = make_hand(landmarks=landmarks)
         out = _format_finger_states(hand)
+        assert 'T:' in out
         assert 'I:EXT' in out
         assert 'M:EXT' in out
         assert 'R:EXT' in out
@@ -265,6 +271,7 @@ class TestFingerStatesFormat:
         landmarks = load_fixture('sample_landmarks.json')['fist_right']
         hand = make_hand(landmarks=landmarks)
         out = _format_finger_states(hand)
+        assert 'T:' in out
         assert 'I:CRL' in out
         assert 'M:CRL' in out
         assert 'R:CRL' in out
@@ -276,10 +283,100 @@ class TestFingerStatesFormat:
         # (per finger_states' graceful degradation).
         hand = make_hand(landmarks=[(0, 0, 0)])
         out = _format_finger_states(hand)
+        assert 'T:' in out
         assert 'I:CRL' in out
         assert 'M:CRL' in out
         assert 'R:CRL' in out
         assert 'P:CRL' in out
+
+
+class TestThumbAnalysis:
+    """_format_thumb_analysis returns state, score, and thumb-index distance."""
+
+    def test_open_palm_has_extended_thumb(self) -> None:
+        from overlay.debug_panel import _format_thumb_analysis
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        out = _format_thumb_analysis(hand)
+        assert 'T:EXT' in out
+        assert 'score=' in out
+        assert 'idx_dist=' in out
+
+    def test_fist_has_curled_thumb(self) -> None:
+        from overlay.debug_panel import _format_thumb_analysis
+        hand = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        out = _format_thumb_analysis(hand)
+        assert 'T:CRL' in out
+        assert 'score=' in out
+
+    def test_no_scale_shows_n_a(self) -> None:
+        from overlay.debug_panel import _format_thumb_analysis
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A',
+                                    hand_scale=None)
+        # Override scale to None
+        from models.data_models import HandData
+        hand = HandData(
+            landmarks=hand.landmarks,
+            chirality=hand.chirality,
+            confidence=hand.confidence,
+            role=hand.role,
+            scale=None,
+        )
+        out = _format_thumb_analysis(hand)
+        assert 'idx_dist=n/a' in out
+
+    def test_short_landmarks_returns_na(self) -> None:
+        from overlay.debug_panel import _format_thumb_analysis
+        hand = make_hand(landmarks=[(0.5, 0.5, 0.0)] * 4)
+        out = _format_thumb_analysis(hand)
+        assert 'N/A' in out or 'n/a' in out
+
+
+class TestSourceDetail:
+    """_format_source_detail renders per-role candidate source/confidence."""
+
+    def test_state_is_none_returns_na(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        assert _format_source_detail(None, 'HAND_A') == 'N/A'
+
+    def test_role_is_none_returns_na(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        state = GesturePipelineState()
+        assert _format_source_detail(state, None) == 'N/A'
+
+    def test_candidate_detail_none_returns_na(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        state = GesturePipelineState(candidate_detail=None)
+        assert _format_source_detail(state, 'HAND_A') == 'N/A'
+
+    def test_role_missing_returns_na(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        state = GesturePipelineState(
+            candidate_detail={'HAND_B': [('fist', 'custom', 0.85)]}
+        )
+        assert _format_source_detail(state, 'HAND_A') == 'N/A'
+
+    def test_mediapipe_candidate_formatted(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        state = GesturePipelineState(
+            candidate_detail={
+                'HAND_A': [('thumbs_up', 'mediapipe', 0.92),
+                            ('fist', 'custom', 0.70)]
+            }
+        )
+        out = _format_source_detail(state, 'HAND_A')
+        assert 'MP=thumbs_up:0.92' in out
+        assert 'CUSTOM=fist:0.70' in out
+
+    def test_custom_only_candidates(self) -> None:
+        from overlay.debug_panel import _format_source_detail
+        state = GesturePipelineState(
+            candidate_detail={
+                'HAND_A': [('pinch', 'custom', 0.75)]
+            }
+        )
+        out = _format_source_detail(state, 'HAND_A')
+        assert 'CUSTOM=pinch:0.75' in out
+        assert 'MP=' not in out
 
 
 class TestScaleFormat:

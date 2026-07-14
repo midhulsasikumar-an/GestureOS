@@ -242,6 +242,145 @@ class TestTrdWorkedExample:
 
 
 # ======================================================================
+# CP-3 Gesture Fusion Priority (TRD §3.9.2)
+# ======================================================================
+
+class TestMediaPipePriority:
+    """MediaPipe Gesture Recognizer candidates must be resolved against
+    custom geometric candidates using the CP-3 Fusion Priority rules."""
+
+    def test_mp_high_confidence_wins_over_custom(self) -> None:
+        """MediaPipe fist at 0.85 beats custom open_palm at 0.92."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', 0.85, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.92, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'fist'
+
+    def test_mp_high_confidence_same_gesture_deduped(self) -> None:
+        """Both MP and custom detect open_palm; MP at 0.85 wins."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('open_palm', 0.85, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.91, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'open_palm'
+        assert winners[0].source == 'mediapipe'
+
+    def test_mp_low_confidence_custom_wins_different_gesture(self) -> None:
+        """MP fist at 0.70 loses to custom open_palm at 0.92."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', 0.70, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.92, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'open_palm'
+
+    def test_mp_low_confidence_custom_wins_same_gesture(self) -> None:
+        """Both detect open_palm; MP at 0.60 removed, custom at 0.90 wins."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('open_palm', 0.60, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.90, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'open_palm'
+        assert winners[0].source == 'unknown'
+
+    def test_mp_low_confidence_no_custom_fallback(self) -> None:
+        """Only MP candidate exists at low confidence — returned as fallback."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', 0.60, False, 'HAND_A', 0.0, source='mediapipe'),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'fist'
+
+    def test_custom_only_gesture_unaffected(self) -> None:
+        """Custom-only gestures (e.g. pinch, ok_sign) still work when
+        no MediaPipe candidate exists."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('pinch', 0.85, False, 'HAND_A', 0.0),
+            GestureResult('open_palm', 0.80, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'pinch'  # higher confidence
+
+    def test_mp_high_confidence_no_custom(self) -> None:
+        """Only MP candidate exists at high confidence — passes through."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('thumbs_up', 0.85, False, 'HAND_A', 0.0, source='mediapipe'),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'thumbs_up'
+
+    def test_mp_confidence_at_threshold_wins(self) -> None:
+        """MP at exactly 0.80 (MEDIAPIPE_WIN_CONFIDENCE) must win."""
+        from gestures.gesture_fuser import MEDIAPIPE_WIN_CONFIDENCE
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', MEDIAPIPE_WIN_CONFIDENCE, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.95, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'fist'
+        assert winners[0].confidence == pytest.approx(MEDIAPIPE_WIN_CONFIDENCE)
+
+    def test_mp_priority_per_role_independent(self) -> None:
+        """HAND_A has high-confidence MP; HAND_B has only custom.
+        Both must resolve independently."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', 0.85, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.92, False, 'HAND_A', 0.0),
+            GestureResult('peace_sign', 0.85, False, 'HAND_B', 0.0),
+            GestureResult('three_fingers', 0.80, False, 'HAND_B', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 2
+        by_role = {w.hand_role: w.gesture_name for w in winners}
+        assert by_role['HAND_A'] == 'fist'  # MP wins
+        assert by_role['HAND_B'] == 'peace_sign'  # custom wins (higher confidence)
+
+    def test_mp_high_confidence_among_custom_competition_fallback(self) -> None:
+        """MP wins regardless of how many custom candidates exist."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('fist', 0.85, False, 'HAND_A', 0.0, source='mediapipe'),
+            GestureResult('open_palm', 0.90, False, 'HAND_A', 0.0),
+            GestureResult('peace_sign', 0.88, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'fist'
+
+    def test_no_mp_candidate_normal_resolution(self) -> None:
+        """No MediaPipe candidate → existing confidence + tie-break logic."""
+        fuser = GestureFuser()
+        candidates = [
+            GestureResult('open_palm', 0.90, False, 'HAND_A', 0.0),
+            GestureResult('fist', 0.85, False, 'HAND_A', 0.0),
+        ]
+        winners = fuser.resolve(candidates)
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'open_palm'  # higher confidence
+
+
+# ======================================================================
 # Hot-path-never-raises (RULES §6.4)
 # ======================================================================
 

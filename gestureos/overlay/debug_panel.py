@@ -72,9 +72,14 @@ import cv2
 import numpy as np
 
 from gestures.gesture_utils import (
+    INDEX_TIP,
     MIDDLE_MCP,
+    THUMB_TIP,
     WRIST,
+    euclidean_distance,
     finger_states,
+    is_thumb_extended,
+    thumb_extension_score,
 )
 from models.data_models import HandData, HandScale
 from diagnostics.pipeline_diagnostics import FrameDiagnostics
@@ -148,6 +153,7 @@ class GesturePipelineState:
     final_gesture_confidence: dict[str, float] | None = None  # role -> conf
     stability_status: dict[str, str] | None = None       # role -> "held Xms" / "N/A"
     cooldown_status: dict[str, str] | None = None        # role -> "Xs remaining" / "ready"
+    candidate_detail: dict[str, list[tuple[str, str, float]]] | None = None  # role -> [(name, source, conf)]
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +216,14 @@ def _format_tracking_confidence(hand: HandData) -> str:
 
 
 def _format_finger_states(hand: HandData) -> str:
-    """Return a compact EXT/CURL string for the four non-thumb fingers."""
+    """Return a compact EXT/CURL string for all five fingers (thumb + 4 non-thumb)."""
     states = finger_states(hand.landmarks)
+    thumb_state = (
+        "EXT" if is_thumb_extended(hand.landmarks, hand.chirality)
+        else "CRL"
+    )
     return (
+        f"T:{thumb_state} "
         f"I:{('EXT' if states['index'] else 'CRL')} "
         f"M:{('EXT' if states['middle'] else 'CRL')} "
         f"R:{('EXT' if states['ring'] else 'CRL')} "
@@ -241,6 +252,44 @@ def _format_bbox(hand: HandData) -> str:
         f"bbox=({bbox[0]:.2f},{bbox[1]:.2f})-"
         f"({bbox[2]:.2f},{bbox[3]:.2f})"
     )
+
+
+def _format_thumb_analysis(hand: HandData) -> str:
+    """Return thumb state, extension score, and thumb-index distance."""
+    if len(hand.landmarks) <= max(THUMB_TIP, INDEX_TIP):
+        return "N/A (short landmarks)"
+    thumb_state = (
+        "EXT" if is_thumb_extended(hand.landmarks, hand.chirality)
+        else "CRL"
+    )
+    score = thumb_extension_score(hand.landmarks, hand.chirality)
+    dist = euclidean_distance(
+        hand.landmarks[THUMB_TIP], hand.landmarks[INDEX_TIP],
+    )
+    if hand.scale is not None and hand.scale.palm_width > 0:
+        norm_dist = dist / hand.scale.palm_width
+        return (
+            f"T:{thumb_state} score={score:.3f} "
+            f"idx_dist={norm_dist:.3f}"
+        )
+    return f"T:{thumb_state} score={score:.3f} idx_dist=n/a"
+
+
+def _format_source_detail(
+    state: GesturePipelineState | None,
+    role: str | None,
+) -> str:
+    """Format per-role candidate details as source=name:conf pairs."""
+    if state is None or role is None or state.candidate_detail is None:
+        return "N/A"
+    details = state.candidate_detail.get(role)
+    if not details:
+        return "N/A"
+    parts = []
+    for name, source, conf in details:
+        display_source = "MP" if source == "mediapipe" else "CUSTOM"
+        parts.append(f"{display_source}={name}:{conf:.2f}")
+    return " | ".join(parts)
 
 
 def _get_gesture_state(
@@ -415,8 +464,12 @@ def render_debug_panel(
             per_hand_lines.append(f"  {bbox_str}")
         per_hand_lines.append(f"  palm_orient: {_palm_orientation(hand)}")
         per_hand_lines.append(f"  fingers: {_format_finger_states(hand)}")
+        per_hand_lines.append(f"  thumb: {_format_thumb_analysis(hand)}")
         per_hand_lines.append(
             f"  candidates: {_get_gesture_state(gesture_state, hand.role, lambda s: s.gesture_candidates)}"
+        )
+        per_hand_lines.append(
+            f"  src: {_format_source_detail(gesture_state, hand.role)}"
         )
         per_hand_lines.append(
             f"  final: {_get_gesture_state(gesture_state, hand.role, lambda s: s.final_gesture)}"

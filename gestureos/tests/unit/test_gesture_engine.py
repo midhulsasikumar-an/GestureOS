@@ -284,6 +284,143 @@ class TestEngineHotPath:
         assert isinstance(candidates, list)
 
 
+
+# ======================================================================
+# MediaPipe Gesture Recognizer integration — CP-3 (TRD §8)
+# ======================================================================
+
+class TestMediaPipeIntegration:
+    """StaticGestureEngine must call ``ModelManager.recognize_gesture()``
+    for every eligible hand when ``model_manager`` is provided."""
+
+    def test_no_model_manager_skips_mp(self) -> None:
+        """Default constructor (model_manager=None) skips MP path."""
+        engine = StaticGestureEngine(make_settings())
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        # No MP result, so all candidates come from custom recognizers.
+        assert isinstance(candidates, list)
+
+    def test_model_manager_none_candidate_skipped(self) -> None:
+        """When model_manager returns None, no MP candidate added."""
+        from unittest.mock import MagicMock
+        mock_mgr = MagicMock()
+        mock_mgr.recognize_gesture.return_value = None
+
+        engine = StaticGestureEngine(make_settings(), model_manager=mock_mgr)
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        assert isinstance(candidates, list)
+
+    def test_model_manager_candidate_included(self) -> None:
+        """MP GestureResult appears in the candidate list."""
+        from unittest.mock import MagicMock
+        from models.data_models import GestureResult
+
+        mp_result = GestureResult(
+            gesture_name='open_palm',
+            confidence=0.92,
+            is_dynamic=False,
+            hand_role='HAND_A',
+            timestamp=100.0,
+            source='mediapipe',
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.recognize_gesture.return_value = mp_result
+
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.5), model_manager=mock_mgr)
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        # The MP candidate should be present alongside any custom candidates.
+        mp_candidates = [c for c in candidates if c.source == 'mediapipe']
+        assert len(mp_candidates) >= 1
+        assert mp_candidates[0].gesture_name == 'open_palm'
+        assert mp_candidates[0].confidence == pytest.approx(0.92)
+
+    def test_mp_result_tagged_with_hand_role(self) -> None:
+        """hand_role from the detected hand must be propagated onto the
+        MP GestureResult so GestureFuser can group by role."""
+        from unittest.mock import MagicMock
+        from models.data_models import GestureResult
+
+        mp_result = GestureResult(
+            gesture_name='fist',
+            confidence=0.90,
+            is_dynamic=False,
+            hand_role='',
+            timestamp=100.0,
+            source='mediapipe',
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.recognize_gesture.return_value = mp_result
+
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.5), model_manager=mock_mgr)
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_B')
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        mp_candidates = [c for c in candidates if c.source == 'mediapipe']
+        assert len(mp_candidates) >= 1
+        assert mp_candidates[0].hand_role == 'HAND_B'
+
+    def test_mp_candidate_filtered_by_confidence(self) -> None:
+        """MP results below the confidence threshold must be dropped."""
+        from unittest.mock import MagicMock
+        from models.data_models import GestureResult
+
+        mp_result = GestureResult(
+            gesture_name='open_palm',
+            confidence=0.30,
+            is_dynamic=False,
+            hand_role='HAND_A',
+            timestamp=100.0,
+            source='mediapipe',
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.recognize_gesture.return_value = mp_result
+
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.85), model_manager=mock_mgr)
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        mp_candidates = [c for c in candidates if c.source == 'mediapipe']
+        assert len(mp_candidates) == 0
+
+    def test_mp_recognizer_error_does_not_propagate(self) -> None:
+        """If model_manager.recognize_gesture raises, the engine must
+        catch the exception and continue (RULES §6.4)."""
+        from unittest.mock import MagicMock
+
+        mock_mgr = MagicMock()
+        mock_mgr.recognize_gesture.side_effect = RuntimeError('mp crash')
+
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.5), model_manager=mock_mgr)
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        engine.update_motion_history([hand], now=0.0)
+        # Must NOT raise.
+        candidates = engine.evaluate([hand], now=0.0)
+        assert isinstance(candidates, list)
+
+    def test_mp_skipped_for_non_eligible_hand(self) -> None:
+        """Hands with gesture_eligible=False must not invoke the MP
+        recognizer."""
+        from unittest.mock import MagicMock
+
+        mock_mgr = MagicMock()
+
+        engine = StaticGestureEngine(make_settings(gesture_confidence_threshold=0.5), model_manager=mock_mgr)
+        from dataclasses import replace
+        hand = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        hand = replace(hand, gesture_eligible=False)
+        engine.update_motion_history([hand], now=0.0)
+        candidates = engine.evaluate([hand], now=0.0)
+        # MP should NOT have been called.
+        mock_mgr.recognize_gesture.assert_not_called()
+        assert candidates == []
+
+
 # Local helper needed for the all-candidates test
 def replace(*args, **kwargs):  # type: ignore[no-untyped-def]
     from dataclasses import replace as _replace
