@@ -413,6 +413,204 @@ def thumb_index_alignment_ratio(
     return float(max(0.0, min(1.0, cos)))
 
 
+# ---------------------------------------------------------------------------
+# 3D vector primitives for palm-relative coordinate system (Thumbs Up CP)
+# ---------------------------------------------------------------------------
+
+
+def _dot3(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> float:
+    """3D dot product."""
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross3(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """3D cross product."""
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec_sub(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Element-wise subtraction of two 3D points."""
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vec_len(v: tuple[float, float, float]) -> float:
+    """Length of a 3D vector."""
+    return math.hypot(v[0], v[1], v[2])
+
+
+def _vec_normalize(
+    v: tuple[float, float, float],
+) -> tuple[float, float, float] | None:
+    """Normalise a 3D vector to unit length. Returns None for zero vector."""
+    norm = _vec_len(v)
+    if norm == 0.0:
+        return None
+    return (v[0] / norm, v[1] / norm, v[2] / norm)
+
+
+# ---------------------------------------------------------------------------
+# Palm-relative coordinate frame (Thumbs Up CP)
+# ---------------------------------------------------------------------------
+
+# Landmark indices used for palm-relative geometry.
+MIDDLE_MCP_IDX: int = 9
+
+
+def compute_palm_axes(
+    landmarks: list[tuple[float, float, float]],
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+] | None:
+    """Compute the palm's local orthonormal coordinate axes from MediaPipe landmarks.
+
+    Returns ``(palm_y, palm_z, palm_x)`` — three orthonormal basis vectors:
+      - ``palm_y``: longitudinal axis (wrist → middle MCP), points from the
+        wrist toward the fingertips — the "up" direction of the palm.
+      - ``palm_x``: lateral axis (index MCP → pinky MCP), points across the
+        palm from the thumb side toward the pinky side.
+      - ``palm_z``: normal axis, perpendicular to the palm plane (points out
+        of the palm toward the camera in a typical front-facing pose).
+
+    Returns ``None`` when the landmarks are too few or the axes are degenerate
+    (e.g., zero-length vectors — should never happen with valid tracking).
+    """
+    if len(landmarks) <= max(WRIST, INDEX_MCP, MIDDLE_MCP_IDX, PINKY_MCP):
+        return None
+
+    wrist = landmarks[WRIST]
+    mid_mcp = landmarks[MIDDLE_MCP_IDX]
+    idx_mcp = landmarks[INDEX_MCP]
+    pin_mcp = landmarks[PINKY_MCP]
+
+    # Longitudinal: wrist → middle MCP (points "up" along the palm).
+    palm_y = _vec_sub(mid_mcp, wrist)
+    # Lateral: index MCP → pinky MCP (points across the palm).
+    palm_x = _vec_sub(pin_mcp, idx_mcp)
+
+    palm_y_norm = _vec_normalize(palm_y)
+    palm_x_norm = _vec_normalize(palm_x)
+    if palm_y_norm is None or palm_x_norm is None:
+        return None
+
+    # Normal: cross product of lateral and longitudinal (points out of palm).
+    palm_z = _cross3(palm_x, palm_y)
+    palm_z_norm = _vec_normalize(palm_z)
+    if palm_z_norm is None:
+        return None
+
+    return (palm_y_norm, palm_z_norm, palm_x_norm)
+
+
+# ---------------------------------------------------------------------------
+# Thumb direction score (palm-relative, rotation-invariant)
+# ---------------------------------------------------------------------------
+
+#: Minimum palm-relative direction score for a thumb to be considered
+#: pointing "up" (along the palm's longitudinal axis).
+THUMB_DIRECTION_MIN_SCORE: float = 0.30
+
+
+def thumb_direction_score(
+    landmarks: list[tuple[float, float, float]],
+) -> float:
+    """Palm-relative thumb direction score.
+
+    Returns a float in ``[0.0, 1.0]`` indicating how much the thumb
+    points "up" (along the palm's longitudinal axis) in the palm's
+    local coordinate frame. This is rotation-invariant — it works
+    correctly regardless of how the hand is rotated in the image plane.
+
+    The score combines:
+      1. **Upward component** (70 %): the projection of the thumb vector
+         (MCP → TIP) onto ``palm_y``. A genuine thumbs-up has the thumb
+         pointing along the palm's longitudinal axis (positive projection).
+      2. **Outward component** (30 %): the projection of the thumb vector
+         onto ``palm_z`` (the palm normal). An extended thumb sticks out
+         from the palm plane, while a curled or folded thumb stays in the
+         palm plane.
+
+    Returns ``0.0`` when the landmarks are insufficient or the palm axes
+    cannot be computed (hot-path-never-raises).
+    """
+    if len(landmarks) <= max(THUMB_MCP, THUMB_TIP, WRIST, INDEX_MCP, MIDDLE_MCP_IDX, PINKY_MCP):
+        return 0.0
+
+    axes = compute_palm_axes(landmarks)
+    if axes is None:
+        return 0.0
+
+    palm_y, palm_z, _palm_x = axes
+
+    # Thumb vector: MCP → TIP (points from the base of the thumb to its tip).
+    thumb_vec = _vec_sub(landmarks[THUMB_TIP], landmarks[THUMB_MCP])
+    thumb_len = _vec_len(thumb_vec)
+    if thumb_len == 0.0:
+        return 0.0
+
+    # Project thumb onto palm axes (normalised by thumb length so the
+    # score is scale-invariant).
+    proj_y = _dot3(thumb_vec, palm_y) / thumb_len
+    proj_z = _dot3(thumb_vec, palm_z) / thumb_len
+
+    # For a genuine thumbs-up:
+    #   - proj_y > 0: thumb points along the palm (upward)
+    #   - proj_z > 0: thumb sticks out of the palm plane
+    upward = max(0.0, proj_y)
+    outward = max(0.0, proj_z)
+
+    score = 0.7 * upward + 0.3 * outward
+    return float(min(1.0, score))
+
+
+# ---------------------------------------------------------------------------
+# Thumb IP joint angle (perspective-invariant extension signal)
+# ---------------------------------------------------------------------------
+
+#: Minimum IP joint angle (degrees) for the thumb to be considered extended
+#: at the IP joint. ~180° = perfectly straight; lower = bent.
+#: 140° is a generous threshold that captures genuine thumbs-up thumbs
+#: (IP angle ≈ 160–180°) while rejecting curled thumbs (IP angle ≈
+#: 80–120°).
+THUMB_IP_EXTENSION_ANGLE_DEG: float = 140.0
+
+
+def thumb_ip_joint_angle(
+    landmarks: list[tuple[float, float, float]],
+) -> float:
+    """Angle at the thumb IP joint (THUMB_MCP → THUMB_IP → THUMB_TIP).
+
+    Returns the angle in degrees. A value close to 180° means the thumb
+    is straight (extended); a small value means the thumb is bent (curled).
+    This signal is perspective-invariant because it is measured in the
+    image plane at the joint itself, not from wrist-relative distances
+    that foreshorten under rotation.
+
+    Returns 0.0 for malformed input (hot-path-never-raises).
+    """
+    if len(landmarks) <= max(THUMB_MCP, THUMB_IP, THUMB_TIP):
+        return 0.0
+    return finger_angle(
+        landmarks[THUMB_MCP],
+        landmarks[THUMB_IP],
+        landmarks[THUMB_TIP],
+    )
+
+
 def remaining_fingers_curled_score(
     landmarks: list[tuple[float, float, float]],
     palm_width: float,

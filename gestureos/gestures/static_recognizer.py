@@ -36,6 +36,7 @@ from gestures.gesture_utils import (
     MIDDLE_TIP,
     PINKY_MCP,
     THUMB_MCP,
+    THUMB_IP,
     THUMB_TIP,
     WRIST,
     euclidean_distance,
@@ -43,6 +44,7 @@ from gestures.gesture_utils import (
     fist_compactness_ratio,
     is_thumb_extended,
     remaining_fingers_curled_score,
+    thumb_direction_score,
     thumb_extension_score,
     thumb_index_alignment_ratio,
 )
@@ -386,29 +388,13 @@ def detect_thumbs_up(hand: HandData) -> GestureResult | None:
     if thumb_score < 0.55:  # Must be well above fist-level score
         return None
 
-    # Priority 2: direction — thumb tip must be substantially above
-    # the thumb MCP *and* above the wrist.
-    # The direction check uses a wrist-to-MCP normalization reference
-    # so it is scale-invariant like the rest of the pipeline (RULES §5.7).
-    wrist = hand.landmarks[WRIST]
-    thumb_mcp = hand.landmarks[THUMB_MCP]
-    thumb_tip = hand.landmarks[THUMB_TIP]
-
-    wrist_to_mcp = euclidean_distance(wrist, thumb_mcp)
-    if wrist_to_mcp <= 0.0:
-        return None
-
-    # Ratio-based displacement: how far the tip is above the MCP / wrist,
-    # normalized by the wrist-to-MCP distance (scale-invariant).
-    dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
-    dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
-
-    direction_score = (
-        max(0.0, min(1.0, dy_mcp_ratio / 1.0)) *
-        max(0.0, min(1.0, dy_wrist_ratio / 1.5))
-    )
+    # Priority 2: direction — palm-relative thumb direction check.
+    # Uses the palm's local coordinate frame (longitudinal axis = wrist →
+    # middle MCP) so the check is rotation-invariant: it works correctly
+    # regardless of how the hand is rotated in the image plane.
+    direction_score = thumb_direction_score(hand.landmarks)
     if direction_score <= 0.0:
-        return None  # not pointing up
+        return None  # not pointing up along the palm's longitudinal axis
 
     # Confidence blends extension strength and direction clarity.
     # For a genuine thumbs-up (thumb_score ≈ 0.93, direction ≈ 1.0)

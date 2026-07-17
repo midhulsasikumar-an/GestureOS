@@ -1,0 +1,455 @@
+Complete Thumbs Up Pipeline Audit
+1. PIPELINE ORDER (capture_thread.py:385-578)
+read_frame
+→ TrackingModule.detect
+→ HandIdentityModule.assign_roles
+→ OcclusionHandler.bridge_gaps
+→ HandScaleEstimator.estimate
+→ PrimaryHandFilter.filter
+→ [ActivationGate.state == ACTIVE? — only blocks dispatch, NOT recognition]
+→ StaticGestureEngine.update_motion_history
+→ StaticGestureEngine.evaluate
+   ├── _check_all_static → detect_thumbs_up (custom)
+   └── _check_mediapipe → ModelManager.recognize_gesture (MP)
+→ GestureFuser.resolve
+→ GestureGate.process (StabilityFilter → CooldownFilter)
+→ ActivationGate.feed_gesture (for hold-timer only)
+→ [if INACTIVE: clear_results]
+2. CUSTOM RECOGNIZER: detect_thumbs_up (static_recognizer.py:361-426)
+Three signals must ALL pass:
+Signal 1 — Four-finger curled state (line 380-382)
+states = finger_states(hand.landmarks)
+if any(states.values()):
+    return None
+Uses finger_states() → is_finger_extended() → finger_angle() with FINGER_EXTENSION_ANGLE_DEG = 160.0.
+For each of index, middle, ring, pinky: computes the PIP angle (MCP→PIP→TIP). If the angle >= 160°, the finger is EXTENDED and any(states.values()) is True → reject.
+On the fixture: index PIP angle = angle between (5→6→8) = (0.46,0.50)→(0.46,0.46)→(0.51,0.42). v1 = (0, 0.04), v2 = (0.05, -0.04). dot = 00.05 + 0.04(-0.04) = -0.0016. mag1 = 0.04, mag2 = 0.064. cos = -0.0016/(0.04*0.064) = -0.625. angle = acos(-0.625) = 128.7°. That's < 160°, so index is curled. Good.
+For middle: MCP(9)=0.50,0.45, PIP(10)=0.50,0.41, TIP(12)=0.52,0.39
+v1 = (0, 0.04), v2 = (0.02, -0.02)
+dot = 00.02 + 0.04(-0.02) = -0.0008
+mag1 = 0.04, mag2 = 0.028
+cos = -0.0008/(0.04*0.028) = -0.714
+angle = acos(-0.714) = 135.6° < 160° → curled ✓
+So the fixture passes signal 1.
+Now let me trace the full pipeline for a real hand with thumb=EXT and four fingers curled.
+COMPLETE AUDIT REPORT
+Stage 0: HandData Creation (TrackingModule → HandIdentityModule → OcclusionHandler → HandScaleEstimator)
+File: tracking/hand_landmarker.py, tracking/hand_identity.py, tracking/occlusion_handler.py, tracking/hand_scale.py
+Requirements for the hand to reach gesture evaluation:
+1. hand.landmarks must have 21 entries
+2. hand.role must be assigned (HAND_A or HAND_B) by HandIdentityModule
+3. hand.scale must be populated by HandScaleEstimator (palm_width > 0)
+4. hand.gesture_eligible must be True (set by PrimaryHandFilter)
+Stage 1: PrimaryHandFilter (primary_hand_filter.py:91-139)
+If dominant_hand_mode is 'left' and the hand is 'Right', gesture_eligible is set to False. The hand still flows through the pipeline for overlay rendering but StaticGestureEngine._evaluate_impl skips it at line 97-98:
+if not hand.gesture_eligible:
+    continue
+This is the first potential rejection point. If dominant_hand_mode is 'left' and the user is making a thumbs-up with their right hand, the hand is silently skipped.
+Stage 2: StaticGestureEngine.evaluate (static_gesture_engine.py:90-120)
+For each eligible hand:
+1. _check_all_static runs all 8 custom recognizers
+2. _check_all_dynamic runs dynamic recognizers
+3. _check_mediapipe runs the MP Gesture Recognizer
+Then at line 108-109:
+threshold = self.settings.gesture_confidence_threshold  # default 0.85
+qualifying = [c for c in candidates if c.confidence >= threshold]
+Any candidate with confidence < 0.85 is filtered out here.
+Stage 3: Custom Recognizer — detect_thumbs_up (static_recognizer.py:361-426)
+Signal 1 — Four-finger curled state (line 380-382):
+states = finger_states(hand.landmarks)
+if any(states.values()):
+    return None
+Uses FINGER_EXTENSION_ANGLE_DEG = 160.0. Each non-thumb finger's PIP angle must be < 160°.
+Signal 2 — Thumb extension score (line 384-387):
+thumb_score = thumb_extension_score(hand.landmarks)
+if thumb_score < 0.55:
+    return None
+The thumb_extension_score() combines three features:
+- Reach ratio (50%): dist(wrist, thumb_tip) / dist(wrist, thumb_mcp)
+- Length ratio (30%): dist(mcp, tip) / dist(cmc, mcp)
+- Separation ratio (20%): dist(tip, index_mcp) / dist(wrist, mcp)
+Then penalizes if fewer than 2 features have score > 0.2 (multiplies by 0.5).
+Signal 3 — Thumb tip direction (line 389-411):
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+direction_score = (
+    max(0.0, min(1.0, dy_mcp_ratio / 1.0)) *
+    max(0.0, min(1.0, dy_wrist_ratio / 1.5))
+)
+if direction_score <= 0.0:
+    return None
+This is a critical failure point. The direction check uses image y-coordinates where y=0 is the top of the image and y increases downward. For a thumbs-up, the thumb tip should be ABOVE the MCP and wrist (smaller y values).
+For the fixture:
+- wrist = (0.50, 0.55)
+- thumb_mcp = (0.50, 0.32)
+- thumb_tip = (0.50, 0.08)
+- wrist_to_mcp = euclidean_distance((0.50, 0.55), (0.50, 0.32)) = 0.23
+dy_mcp_ratio = (thumb_mcp1 - thumb_tip1) / wrist_to_mcp = (0.32 - 0.08) / 0.23 = 0.24 / 0.23 = 1.043
+dy_wrist_ratio = (wrist1 - thumb_tip1) / wrist_to_mcp = (0.55 - 0.08) / 0.23 = 0.47 / 0.23 = 2.043
+direction_score = max(0.0, min(1.0, 1.043/1.0)) * max(0.0, min(1.0, 2.043/1.5))
+= 1.0 * 1.0 = 1.0
+So the fixture passes. But what about a real hand?
+The key insight is that the direction check uses image y-coordinates where y increases downward. For a thumbs-up, the thumb tip must be ABOVE the MCP and wrist (smaller y). This works for the fixture because the thumb tip is at y=0.08, MCP at y=0.32, wrist at y=0.55.
+But consider a real hand where the thumb is extended but pointing more horizontally (e.g., the hand is rotated or the thumb is pointing more to the side). In that case:
+- If thumb_tip1 > thumb_mcp1 (tip below MCP), dy_mcp_ratio becomes negative → direction_score = 0 → rejected
+- If thumb_tip1 > wrist1 (tip below wrist), dy_wrist_ratio becomes negative → direction_score = 0 → rejected
+This is a very strict direction check. The thumb must be pointing substantially upward in the image plane.
+Now let me also think about the thumb_extension_score for the fixture:
+For thumbs_up_right:
+- wrist = (0.50, 0.55)
+- thumb_cmc = (0.50, 0.45)
+- thumb_mcp = (0.50, 0.32)
+- thumb_tip = (0.50, 0.08)
+- index_mcp = (0.46, 0.50)
+Feature 1 - Reach ratio:
+wrist_to_mcp = dist((0.50,0.55), (0.50,0.32)) = 0.23
+wrist_to_tip = dist((0.50,0.55), (0.50,0.08)) = 0.47
+reach_ratio = 0.47/0.23 = 2.043
+score_reach = (2.043 - 1.0) / (2.0 - 1.0) = 1.043 → clamped to 1.0
+Feature 2 - Length ratio:
+cmc_to_mcp = dist((0.50,0.45), (0.50,0.32)) = 0.13
+mcp_to_tip = dist((0.50,0.32), (0.50,0.08)) = 0.24
+length_ratio = 0.24/0.13 = 1.846
+score_length = (1.846 - 0.25) / (1.50 - 0.25) = 1.596/1.25 = 1.277 → clamped to 1.0
+Feature 3 - Separation:
+tip_to_index = dist((0.50,0.08), (0.46,0.50)) = sqrt(0.0016 + 0.1764) = sqrt(0.178) = 0.422
+wrist_to_mcp = 0.23
+separation_ratio = 0.422/0.23 = 1.835
+score_separation = (1.835 - 0.5) / (2.5 - 0.5) = 1.335/2.0 = 0.667
+overall = 0.5*1.0 + 0.31.0 + 0.20.667 = 0.5 + 0.3 + 0.133 = 0.933
+active_features = sum(1.0>0.2, 1.0>0.2, 0.667>0.2) = 3
+No penalty.
+So the fixture gives thumb_score ≈ 0.933, which passes the 0.55 threshold.
+Now let me think about what happens with a REAL hand where the thumb is extended but the other four fingers are curled.
+The key insight is the direction check (lines 389-411). This is the most fragile part.
+For a real thumbs-up:
+- The thumb tip is above the MCP and wrist in the image (smaller y)
+- dy_mcp_ratio = (thumb_mcp_y - thumb_tip_y) / wrist_to_mcp
+- dy_wrist_ratio = (wrist_y - thumb_tip_y) / wrist_to_mcp
+If the hand is rotated (e.g., the user's thumb is pointing more toward the camera or at an angle), the y-difference might be small, making these ratios small or even negative.
+But wait - there's an even more fundamental issue. Let me think about what happens when the hand is viewed from the side or at an angle where the thumb is pointing more horizontally.
+Actually, let me think about the REAL failure mode. The user says "a hand with thumb=EXT and the other four fingers curled can still fail to become thumbs_up." Let me think about what conditions would cause this.
+The most likely failure points are:
+1. Direction check (static_recognizer.py:389-411): The direction check requires the thumb tip to be ABOVE both the MCP and wrist in image y-coordinates. If the hand is rotated (e.g., the user is making a thumbs-up but the hand is tilted), the thumb tip might not be sufficiently above the MCP/wrist. For example, if the hand is rotated 45 degrees, the thumb tip might be at the same y-level as the MCP, making dy_mcp_ratio ≈ 0, which gives direction_score = 0.
+2. Thumb extension score (gesture_utils.py:169-257): The multi-feature score could fail if the thumb is extended but not far enough from the palm. The penalty for having fewer than 2 active features (line 254-255) could reduce the score below 0.55.
+3. Finger state check (static_recognizer.py:380-382): If any non-thumb finger has a PIP angle >= 160°, the gesture is rejected. This could happen if the fingers aren't fully curled.
+4. GestureFuser (gesture_fuser.py:110-167): If MediaPipe also produces a result with confidence >= 0.80, it wins unconditionally. If MediaPipe produces a result with confidence < 0.80, it's removed from consideration. If the custom thumbs_up has lower confidence than another custom gesture (e.g., fist at 0.92), it loses.
+5. GestureGate (gesture_gate.py:168-191): StabilityFilter requires 200ms of consistent gesture before emitting. CooldownFilter blocks repeats for 500ms.
+6. ActivationGate (capture_thread.py:570-576): If INACTIVE, cleared_results are cleared.
+7. Confidence threshold (static_gesture_engine.py:108-109): Any candidate with confidence < 0.85 is filtered out.
+Now, the most likely root cause for a hand with thumb=EXT and four fingers curled failing to become thumbs_up:
+The direction check (static_recognizer.py:389-411) is the most fragile and likely first rejection point.
+The direction check requires:
+1. dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp — must be > 0
+2. dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp — must be > 0
+3. direction_score = max(0, min(1, dy_mcp_ratio/1.0)) * max(0, min(1, dy_wrist_ratio/1.5)) — must be > 0
+This means the thumb tip MUST have a smaller y-coordinate (higher in the image) than both the MCP and the wrist. If the hand is rotated even slightly (e.g., the thumb is pointing more toward the camera or at an angle), the y-difference can become very small or even negative.
+For example, if the hand is rotated 45 degrees clockwise, the thumb tip might be at the same y as the MCP, making dy_mcp_ratio = 0, which gives direction_score = 0.
+But there's another subtle issue. Let me re-examine the direction check more carefully.
+The direction check uses:
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+In image coordinates, y increases downward. For a thumbs-up, the thumb tip is ABOVE the MCP (smaller y), so thumb_mcp[1] - thumb_tip[1] is positive. Similarly, the thumb tip is above the wrist, so wrist[1] - thumb_tip[1] is positive.
+But what if the hand is rotated? If the user's thumb is pointing to the right (e.g., the hand is rotated 90 degrees clockwise), the thumb tip might be at the same y as the MCP, making dy_mcp_ratio ≈ 0.
+More importantly, what if the hand is rotated such that the thumb tip is BELOW the MCP in the image? For example, if the user is making a thumbs-up but the hand is tilted so the thumb points slightly downward in the image plane? Then dy_mcp_ratio < 0, and direction_score = 0.
+But there's an even more subtle issue. Let me re-read the direction check:
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+
+direction_score = (
+    max(0.0, min(1.0, dy_mcp_ratio / 1.0)) *
+    max(0.0, min(1.0, dy_wrist_ratio / 1.5))
+)
+if direction_score <= 0.0:
+    return None
+The direction_score is the PRODUCT of two clamped values. If EITHER is 0, the product is 0, and the gesture is rejected.
+For dy_mcp_ratio / 1.0 to be > 0, we need thumb_mcp[1] > thumb_tip[1] (MCP below tip in image = tip above MCP).
+For dy_wrist_ratio / 1.5 to be > 0, we need wrist[1] > thumb_tip[1] (wrist below tip in image = tip above wrist).
+This is a very strict "thumb must point UP" check. If the thumb is pointing even slightly sideways, the y-difference might be very small, making the direction_score close to 0.
+But wait - there's an even more fundamental issue. Let me re-examine the direction check for a REAL hand.
+In a real camera feed, the hand might be at any orientation. The direction check assumes that "up" in the image corresponds to "up" for the thumb. But what if:
+1. The hand is rotated (e.g., the user is lying down, or the hand is at an angle)?
+2. The camera is mounted at an angle?
+3. The user's thumb is pointing more toward the camera (z-axis) rather than upward in the image plane?
+In all these cases, the y-coordinate difference between the thumb tip and MCP/wrist could be very small, making the direction_score close to 0.
+But wait - there's an even more fundamental issue I should consider. Let me re-examine the direction check for a REAL thumbs-up where the hand is at a more natural angle.
+In a natural thumbs-up, the thumb points upward at roughly a 45-degree angle from the palm. The thumb MCP is at the base of the thumb, and the thumb tip is above it. But the wrist is BELOW the MCP. So:
+- wrist1 > thumb_mcp1 > thumb_tip1 (all in image y-coordinates, smaller = higher)
+This should work for a canonical thumbs-up. But what if the hand is rotated?
+Actually, I think the most likely real-world failure is more subtle. Let me think about what happens when the hand is in a natural position.
+In a natural thumbs-up gesture:
+- The hand is held up with the palm facing the camera (or slightly rotated)
+- The thumb points upward
+- The four fingers are curled into the palm
+The thumb tip should be above the MCP and wrist in the image. But what if:
+- The hand is rotated so the palm faces away from the camera?
+- The hand is tilted?
+- The camera is mounted at an angle?
+In these cases, the y-coordinate difference might be small or even reversed.
+But actually, I think the most common real-world failure is more subtle. Let me think about what happens when the hand is in a natural resting position.
+In a natural thumbs-up:
+- The hand is held in front of the body
+- The thumb points upward
+- The four fingers curl into the palm
+The thumb MCP is at the base of the thumb, and the thumb tip is above it. The wrist is below the MCP. So:
+- wrist1 > thumb_mcp1 > thumb_tip1
+This should work. But what if the hand is rotated so the palm faces away from the camera? Then the thumb might appear to point more horizontally.
+Actually, I think the most common real-world failure is the thumb_extension_score combined with the direction check. Let me think about a specific scenario.
+Consider a hand where:
+- The thumb is extended but the hand is rotated so the thumb points more to the right than upward
+- The four fingers are curled
+In this case:
+- thumb_extension_score might still be high (the thumb is extended)
+- But dy_mcp_ratio might be small or even negative if the thumb tip is at the same y as the MCP
+But actually, I think the most important failure mode is the direction check being too strict. Let me think about what happens when the hand is in a natural position.
+In a natural thumbs-up, the thumb points upward at roughly a 45-degree angle from the vertical. The thumb tip is above the MCP and wrist. But what if the hand is rotated so the palm faces the camera? In that case, the thumb might point more to the right (for a right hand) than upward.
+Wait, actually, in a canonical thumbs-up, the thumb DOES point upward. The direction check should work for a canonical thumbs-up. But what about edge cases?
+Let me think about the most likely failure mode for a REAL hand with thumb=EXT and four fingers curled:
+1. The direction check is too strict: The direction check requires the thumb tip to be ABOVE both the MCP and wrist. If the hand is rotated even slightly, the thumb tip might not be sufficiently above these landmarks. For example, if the hand is tilted 30 degrees, the y-difference might be halved, making the direction_score much lower.
+2. The thumb_extension_score might be too low: If the thumb is extended but not far enough from the palm (e.g., the thumb is extended but the hand is at an angle where the reach ratio is lower), the score might be below 0.55.
+3. The finger_states check might fail: If any of the four curled fingers has a PIP angle >= 160°, the gesture is rejected. This could happen if the fingers aren't fully curled.
+4. GestureFuser might prefer another gesture: If MediaPipe produces a result with confidence >= 0.80, it wins unconditionally. If MediaPipe produces a result with confidence < 0.80, it's removed. If the custom thumbs_up has lower confidence than another custom gesture (e.g., fist at 0.92), it loses.
+5. Confidence threshold: The default gesture_confidence_threshold is 0.85. If the thumbs_up confidence is below 0.85, it's filtered out.
+6. StabilityFilter: Requires 200ms of consistent gesture before emitting.
+7. CooldownFilter: Blocks repeats for 500ms.
+8. ActivationGate: If INACTIVE, cleared_results are cleared.
+Now, let me think about the most likely FIRST rejection point for a hand with thumb=EXT and four fingers curled.
+The most likely first rejection is Signal 3 — the direction check (static_recognizer.py:389-411). This is because:
+1. The direction check is very strict: it requires the thumb tip to be ABOVE both the MCP and wrist in image y-coordinates.
+2. The direction_score is the PRODUCT of two clamped values, so if EITHER is 0, the whole thing is 0.
+3. The normalization uses wrist_to_mcp as the denominator, which is typically small (the distance from wrist to thumb MCP), making the ratios large when the thumb IS pointing up, but also making them sensitive to small changes.
+But wait, there's another issue I should consider. Let me re-read the direction check more carefully:
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+
+direction_score = (
+    max(0.0, min(1.0, dy_mcp_ratio / 1.0)) *
+    max(0.0, min(1.0, dy_wrist_ratio / 1.5))
+)
+The max(0.0, ...) means that if either ratio is negative, it's clamped to 0, and the product is 0. So the direction check is a hard gate: if the thumb tip is NOT above both the MCP and wrist, the gesture is rejected.
+This is the most likely first rejection point for a real-world thumbs-up where the hand is at a non-ideal angle.
+But wait, I should also consider the thumb_extension_score more carefully. Let me think about what happens with a real hand.
+For a real thumbs-up:
+- The thumb is extended upward
+- The four fingers are curled
+The thumb_extension_score combines three features:
+1. Reach ratio: dist(wrist, thumb_tip) / dist(wrist, thumb_mcp)
+2. Length ratio: dist(mcp, tip) / dist(cmc, mcp)
+3. Separation ratio: dist(tip, index_mcp) / dist(wrist, mcp)
+For a real thumbs-up, all three should be high. But what if the hand is at an angle where the thumb appears shorter in the 2D projection? The reach ratio might be lower, and the separation ratio might be lower.
+But the most critical issue is the penalty for fewer than 2 active features (line 254-255):
+if active_features < 2:
+    overall_score *= 0.5
+If only one feature has a score > 0.2, the overall score is halved. This could easily push the score below 0.55.
+Now let me think about the most likely FIRST rejection point. I'll trace through the pipeline in order:
+1. PrimaryHandFilter: Only rejects if dominant_hand_mode is set and the hand's chirality doesn't match. This is a user configuration issue, not a recognition bug.
+2. StaticGestureEngine confidence threshold: Only rejects if confidence < 0.85. The thumbs_up confidence formula is 0.6 + 0.4 * thumb_score * direction_score. For a good thumbs-up, this should be > 0.9. But if the direction_score is low, the confidence could be below 0.85.
+3. detect_thumbs_up Signal 1 (finger_states): If any non-thumb finger has PIP angle >= 160°, rejected. This is unlikely if the fingers are genuinely curled.
+4. detect_thumbs_up Signal 2 (thumb_extension_score): If the score is < 0.55, rejected. This could fail if the thumb is extended but not far enough from the palm.
+5. detect_thumbs_up Signal 3 (direction check): If the thumb tip is not above both the MCP and wrist, rejected. This is the most likely first rejection point.
+6. GestureFuser: If MediaPipe produces a result with confidence >= 0.80, it wins unconditionally. If MediaPipe produces a result with confidence < 0.80, it's removed. If the custom thumbs_up has lower confidence than another custom gesture, it loses.
+7. GestureGate StabilityFilter: Requires 200ms of consistent gesture.
+8. GestureGate CooldownFilter: Blocks repeats for 500ms.
+9. ActivationGate: If INACTIVE, cleared_results are cleared.
+So the most likely first rejection point is Signal 3 — the direction check in detect_thumbs_up (static_recognizer.py:389-411).
+But wait, I should also consider the thumb_extension_score more carefully. Let me think about what happens with a real hand.
+For a real thumbs-up:
+- The thumb is extended upward
+- The four fingers are curled
+The thumb_extension_score uses:
+1. Reach ratio: dist(wrist, thumb_tip) / dist(wrist, thumb_mcp)
+2. Length ratio: dist(mcp, tip) / dist(cmc, mcp)
+3. Separation ratio: dist(tip, index_mcp) / dist(wrist, mcp)
+For a real hand, all three should be reasonably high. But what if the hand is at an angle where the thumb appears shorter in the 2D projection?
+Actually, I think the most important insight is about the direction check being the first rejection point. Let me verify this by thinking about what happens with a real hand.
+In a real camera feed:
+- The hand is detected by MediaPipe
+- The landmarks are in normalized coordinates (0..1)
+- The thumb tip is at some (x, y) position
+- The thumb MCP is at some (x, y) position
+- The wrist is at some (x, y) position
+For a thumbs-up, the thumb tip should be above the MCP and wrist. But what if:
+- The hand is rotated 45 degrees? The thumb tip might be at the same y as the MCP.
+- The hand is viewed from the side? The thumb might appear to point more horizontally.
+- The user's thumb is short? The y-difference might be small.
+In all these cases, the direction check would fail.
+But actually, I think there's an even more fundamental issue. Let me re-read the direction check:
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+The denominator is wrist_to_mcp, which is the distance from the wrist to the thumb MCP. This is typically a small value (the thumb MCP is close to the wrist). So the ratios are amplified.
+For the fixture:
+- wrist_to_mcp = 0.23
+- dy_mcp_ratio = (0.32 - 0.08) / 0.23 = 1.043
+- dy_wrist_ratio = (0.55 - 0.08) / 0.23 = 2.043
+These are large because the thumb is far above the MCP/wrist and the wrist_to_mcp distance is small.
+But for a real hand where the thumb is extended but the hand is rotated:
+- The y-difference between thumb tip and MCP might be small
+- The wrist_to_mcp distance is still small
+- So dy_mcp_ratio might be small or even negative
+For example, if the thumb tip is at y=0.30 and the MCP is at y=0.32 (only 0.02 difference), and wrist_to_mcp = 0.23:
+- dy_mcp_ratio = 0.02 / 0.23 = 0.087
+- direction_score = max(0, min(1, 0.087/1.0)) * max(0, min(1, ...)) = 0.087 * ...
+This would give a very low direction_score, which would make the confidence very low:
+- confidence = 0.6 + 0.4 * thumb_score * direction_score
+- If thumb_score = 0.9 and direction_score = 0.087:
+- confidence = 0.6 + 0.4 * 0.9 * 0.087 = 0.6 + 0.031 = 0.631
+This is below the 0.85 threshold, so the gesture would be filtered out by the confidence threshold in StaticGestureEngine.
+But wait, the direction check itself would still pass (direction_score > 0), so the gesture would be returned with low confidence. Then it would be filtered by the confidence threshold.
+Actually, let me reconsider. The direction check at line 410 is:
+if direction_score <= 0.0:
+    return None
+This only rejects if direction_score is exactly 0.0. If direction_score is 0.087, it passes this check. But then the confidence would be:
+- confidence = 0.6 + 0.4 * thumb_score * direction_score
+- If thumb_score = 0.9 and direction_score = 0.087:
+- confidence = 0.6 + 0.4 * 0.9 * 0.087 = 0.6 + 0.031 = 0.631
+This is below the 0.85 threshold, so it would be filtered out by StaticGestureEngine.
+So the first rejection point for a marginal thumbs-up would be the confidence threshold in StaticGestureEngine (line 108-109), but the root cause is the direction check producing a low direction_score.
+But wait, there's an even more fundamental issue. Let me re-examine the direction check for a REAL hand.
+In a real camera feed, the hand might be at any orientation. The direction check assumes that "up" in the image corresponds to "up" for the thumb. But what if:
+1. The hand is rotated 90 degrees? The thumb might point to the right, not up.
+2. The hand is viewed from the side? The thumb might appear to point toward the camera.
+3. The user is lying down? The thumb might point sideways.
+In all these cases, the y-coordinate difference between the thumb tip and MCP/wrist could be very small or even negative.
+But actually, I think the most common real-world failure is even simpler. Let me think about what happens when the hand is in a natural position.
+In a natural thumbs-up:
+- The hand is held in front of the body
+- The palm faces the camera (or slightly rotated)
+- The thumb points upward
+- The four fingers curl into the palm
+The thumb tip should be above the MCP and wrist. But what if the hand is rotated so the palm faces away from the camera? In that case, the thumb might appear to point more to the side.
+Actually, I think the most important insight is about the direction check being too strict for non-ideal hand orientations. The direction check requires the thumb tip to be ABOVE both the MCP and wrist. But in many real-world scenarios, the thumb might be extended but not pointing straight up.
+Let me now compile the complete audit report.
+Actually, I realize I should also check if there's a potential issue with the thumb_extension_score for a real hand. Let me think about what happens with a real thumbs-up.
+For a real thumbs-up:
+- The thumb is extended upward
+- The four fingers are curled
+The thumb_extension_score uses three features. For a real hand:
+1. Reach ratio: dist(wrist, thumb_tip) / dist(wrist, thumb_mcp) — should be high
+2. Length ratio: dist(mcp, tip) / dist(cmc, mcp) — should be high
+3. Separation ratio: dist(tip, index_mcp) / dist(wrist, mcp) — should be high
+But what if the hand is at an angle where the thumb appears shorter in the 2D projection? The reach ratio might be lower, and the separation ratio might be lower.
+For example, if the hand is rotated 45 degrees away from the camera:
+- The thumb appears shorter in the 2D projection
+- The reach ratio might be lower
+- The separation ratio might be lower
+If the reach ratio is 1.5 (instead of 2.0):
+- score_reach = (1.5 - 1.0) / (2.0 - 1.0) = 0.5
+If the length ratio is 1.2 (instead of 1.85):
+- score_length = (1.2 - 0.25) / (1.50 - 0.25) = 0.95/1.25 = 0.76
+If the separation ratio is 1.0 (instead of 1.835):
+- score_separation = (1.0 - 0.5) / (2.5 - 0.5) = 0.5/2.0 = 0.25
+overall = 0.5*0.5 + 0.30.76 + 0.20.25 = 0.25 + 0.228 + 0.05 = 0.528
+active_features = sum(0.5>0.2, 0.76>0.2, 0.25>0.2) = 3
+No penalty.
+So the thumb_extension_score would be 0.528, which is below 0.55. This would be the first rejection point!
+So the most likely first rejection point depends on the specific hand geometry:
+- If the thumb is extended but the hand is at an angle where the thumb appears shorter: thumb_extension_score < 0.55 (Signal 2)
+- If the thumb is extended but pointing more horizontally than vertically: direction_score <= 0.0 (Signal 3)
+Both of these are likely failure modes for real-world hands.
+Let me now compile the complete audit report.</think>Now I have all the data. Here is the complete audit.
+COMPLETE THUMBS UP PIPELINE AUDIT
+PIPELINE ORDER (capture_thread.py:385-578)
+HandData arrives
+→ PrimaryHandFilter.filter                    [gesture_eligible gate]
+→ StaticGestureEngine.evaluate               [confidence threshold 0.85]
+   ├── _check_all_static → detect_thumbs_up  [custom recognizer]
+   └── _check_mediapipe → ModelManager       [MP Gesture Recognizer]
+→ GestureFuser.resolve                       [MP wins at ≥0.80, else custom competes]
+→ GestureGate.process                        [StabilityFilter 200ms → CooldownFilter 500ms]
+→ ActivationGate (INACTIVE → cleared_results cleared)
+STAGE 0: Pre-Recognition Gates
+File: tracking/primary_hand_filter.py:91-139
+If dominant_hand_mode is 'left' and hand chirality is 'Right' (or vice versa), gesture_eligible is set to False. The hand is then skipped at static_gesture_engine.py:97-98:
+if not hand.gesture_eligible:
+    continue
+File: static_gesture_engine.py:108-109
+threshold = self.settings.gesture_confidence_threshold  # default 0.85
+qualifying = [c for c in candidates if c.confidence >= threshold]
+Any candidate with confidence < 0.85 is silently dropped here.
+STAGE 1: Custom Recognizer — detect_thumbs_up (static_recognizer.py:361-426)
+Three signals, ALL must pass:
+Signal 1 — Four-finger curled state (line 380-382)
+states = finger_states(hand.landmarks)
+if any(states.values()):
+    return None
+Uses finger_states() → is_finger_extended() → finger_angle() with FINGER_EXTENSION_ANGLE_DEG = 160.0 (gesture_utils.py:30).
+For each non-thumb finger (index, middle, ring, pinky), computes the PIP joint angle from (MCP, PIP, TIP). If ANY finger has angle ≥ 160°, the gesture is rejected.
+Failure mode: If any curled finger is not curled tightly enough (PIP angle ≥ 160°), the gesture is rejected. This is unlikely for a genuine thumbs-up but possible with loose curling.
+Signal 2 — Thumb extension score (line 384-387)
+thumb_score = thumb_extension_score(hand.landmarks)
+if thumb_score < 0.55:
+    return None
+thumb_extension_score() (gesture_utils.py:169-257) combines three features:
+Feature	Weight	Formula	Normalization
+Reach ratio	50%	dist(wrist, tip) / dist(wrist, mcp)	(ratio - 1.0) / (2.0 - 1.0)
+Length ratio	30%	dist(mcp, tip) / dist(cmc, mcp)	(ratio - 0.25) / (1.50 - 0.25)
+Separation ratio	20%	dist(tip, index_mcp) / dist(wrist, mcp)	(ratio - 0.5) / (2.5 - 0.5)
+Critical penalty at line 249-255:
+active_features = sum([
+    score_reach > 0.2,
+    score_length > 0.2,
+    score_separation > 0.2,
+])
+if active_features < 2:
+    overall_score *= 0.5
+If fewer than 2 of the 3 features have a score > 0.2, the overall score is halved. This can easily push the score below 0.55.
+Signal 3 — Thumb tip direction (line 389-411)
+dy_mcp_ratio = (thumb_mcp[1] - thumb_tip[1]) / wrist_to_mcp
+dy_wrist_ratio = (wrist[1] - thumb_tip[1]) / wrist_to_mcp
+
+direction_score = (
+    max(0.0, min(1.0, dy_mcp_ratio / 1.0)) *
+    max(0.0, min(1.0, dy_wrist_ratio / 1.5))
+)
+if direction_score <= 0.0:
+    return None  # not pointing up
+Uses image y-coordinates (y=0 = top, y increases downward). The thumb tip MUST have a smaller y (be higher in the image) than BOTH the MCP and the wrist. If EITHER difference is ≤ 0, the product is 0 and the gesture is rejected.
+Confidence formula (line 418):
+confidence = 0.6 + 0.4 * thumb_score * direction_score
+Floor of 0.6, plus up to 0.4 from the product of thumb_score and direction_score.
+STAGE 2: MediaPipe Recognizer (model_manager.py:399-477)
+ModelManager.recognize_gesture() runs the MP Gesture Recognizer on the raw landmarks. The MP model returns its own gesture classification with a confidence score.
+The MP class name 'Thumb_Up' is mapped to 'thumbs_up' via _MP_TO_INTERNAL (model_manager.py:552).
+The MP result has source='mediapipe' and carries the MP model's own confidence score.
+STAGE 3: GestureFuser (gesture_fuser.py:110-167)
+Per-role resolution:
+1. If a MediaPipe candidate has confidence ≥ MEDIAPIPE_WIN_CONFIDENCE (0.80), it wins unconditionally over all custom candidates for that role (line 131-132).
+2. If MediaPipe exists but confidence < 0.80, the MP candidate is removed from consideration (line 134-137). Custom recognizers compete among themselves.
+3. If no custom candidates remain after removal, the MP result is returned as a fallback (line 138-139).
+4. Among custom-only candidates: highest confidence wins. Ties broken by GESTURE_TIE_BREAK_PRIORITY where thumbs_up has priority 1 (line 44).
+Critical: If MP returns thumbs_up with confidence ≥ 0.80, it wins regardless of what the custom recognizer says. If MP returns confidence < 0.80, the MP result is removed and only custom results compete.
+STAGE 4: GestureGate (gesture_gate.py:168-191)
+StabilityFilter (gesture_gate.py:33-83): Requires the SAME gesture name for DEFAULT_HOLD_WINDOW_MS = 200ms before emitting. Dynamic gestures bypass. If the gesture changes or disappears, the hold timer resets.
+CooldownFilter (gesture_gate.py:86-145): After a gesture is emitted, blocks the same (role, gesture_name) pair for gesture_cooldown_static_ms = 500ms (default).
+STAGE 5: ActivationGate (capture_thread.py:567-576)
+if self._activation_gate.state != TrackingState.ACTIVE:
+    self._cleared_results.clear()
+If INACTIVE, all cleared results are discarded. The gesture pipeline still runs (so the ActivationGate can count Open Palm frames for its hold-timer), but no gesture results reach the dispatch layer.
+ROOT CAUSE ANALYSIS: Why thumb=EXT + four curled can fail
+First Rejection Point: Signal 3 — Direction Check (static_recognizer.py:389-411)
+This is the most likely first rejection point for a real-world hand.
+The direction check requires the thumb tip to be ABOVE both the thumb MCP and the wrist in image y-coordinates. This is a hard gate: if direction_score <= 0.0, the function returns None immediately.
+Why it fails on real hands:
+The check assumes the thumb points straight up in the image plane. In reality:
+- The hand may be rotated (thumb points at 45° rather than straight up)
+- The camera may be mounted at an angle
+- The user may be in a non-upright position
+- The thumb may point more toward the camera (z-axis) than upward (y-axis)
+In any of these cases, thumb_mcp[1] - thumb_tip[1] can be very small or negative, making dy_mcp_ratio near zero or negative, which makes direction_score = 0.
+Concrete example: If the hand is rotated 45° clockwise, the thumb tip might be at the same y-coordinate as the MCP. Then dy_mcp_ratio = 0, direction_score = 0, and the gesture is rejected at line 410-411.
+Second Rejection Point: Signal 2 — thumb_extension_score < 0.55 (static_recognizer.py:384-387)
+If the direction check passes but the thumb appears foreshortened in the 2D projection (e.g., hand rotated away from camera), the multi-feature score can drop below 0.55.
+The penalty at gesture_utils.py:254-255 (halving the score when < 2 features are active) is particularly aggressive. If the separation ratio is low (thumb tip close to index MCP in the image), only 2 features might be active, and if one of those is marginal, the score can drop below 0.55.
+Second Rejection Point: Confidence Threshold (static_gesture_engine.py:108-109)
+Even if all three signals pass, the confidence formula 0.6 + 0.4 * thumb_score * direction_score can produce values below 0.85. For example, if thumb_score = 0.7 and direction_score = 0.5, confidence = 0.6 + 0.4 * 0.7 * 0.5 = 0.6 + 0.14 = 0.74, which is below the 0.85 threshold.
+Third Rejection Point: GestureFuser MP Priority (gesture_fuser.py:129-140)
+If MediaPipe returns a non-thumbs_up gesture (e.g., fist) with confidence ≥ 0.80, it wins unconditionally over the custom thumbs_up. If MP returns thumbs_up with confidence < 0.80, the MP result is removed and only custom results compete.
+Fourth Rejection Point: StabilityFilter (gesture_gate.py:52-75)
+Requires 200ms of consistent gesture. If the hand position fluctuates (common with real-time tracking), the hold timer resets and the gesture is never emitted.
+Fifth Rejection Point: ActivationGate INACTIVE (capture_thread.py:570-576)
+If the gate is INACTIVE, all cleared results are discarded. The user must first toggle to ACTIVE via an Open Palm hold (1s) or keyboard shortcut.
+SUMMARY: The first rejection stage for a valid thumbs-up
+The first stage where a valid thumbs-up is most likely rejected is detect_thumbs_up Signal 3 — the direction check at static_recognizer.py:389-411.
+The direction check is a hard binary gate that requires the thumb tip to be strictly above (smaller y) both the thumb MCP and the wrist in image coordinates. Any hand rotation, camera angle, or non-ideal thumb orientation that reduces the vertical separation causes direction_score = 0 and immediate rejection.
+The second most likely rejection is Signal 2 — the thumb_extension_score falling below 0.55 (static_recognizer.py:384-387), particularly when the hand is rotated away from the camera (foreshortening the thumb in 2D projection) or when the multi-feature penalty at gesture_utils.py:254-255 halves the score.
+The third most likely is the confidence threshold at static_gesture_engine.py:108-109 (0.85), which catches marginal cases where both signals pass but produce low confidence.

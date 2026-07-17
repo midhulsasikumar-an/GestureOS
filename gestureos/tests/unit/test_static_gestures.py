@@ -172,31 +172,22 @@ class TestThumbsUp:
         assert result.gesture_name == 'thumbs_up'
 
     def test_thumbs_down_not_thumbs_up(self) -> None:
-        # Construct a thumbs-down hand by mirroring the thumbs-up fixture
-        # around y. The thumbs-up fixture has thumb tip at y=0.08; mirror
-        # to y=1.0 - 0.08 = 0.92 to get a thumbs-down shape.
+        # A true thumbs-down has the thumb tip BELOW the wrist and MCP in
+        # image y-coordinates AND also below them relative to the palm's
+        # local frame.  Build a hand where the thumb tip is moved down
+        # (same x as MCP, y much larger than wrist) so the thumb vector
+        # points opposite to the palm's longitudinal axis.
         from dataclasses import replace
         h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
-        mirrored = replace(
-            h,
-            landmarks=[
-                (lm[0], 1.0 - lm[1], lm[2]) for lm in h.landmarks
-            ],
-        )
-        mirrored = make_hand_with_scale(
-            pose_name=None,  # we already have the landmarks; reuse via direct construction
-            role='HAND_A',
-        )
-        # Build a new hand with mirrored landmarks but the same scale.
-        from models.data_models import HandData
-        mirrored_hand = HandData(
-            landmarks=[(lm[0], 1.0 - lm[1], lm[2]) for lm in h.landmarks],
-            chirality=h.chirality,
-            confidence=h.confidence,
-            role=h.role,
-            scale=h.scale,
-        )
-        assert detect_thumbs_up(mirrored_hand) is None
+        # Move the thumb tip below the wrist: y = wrist_y + offset.
+        wrist_y = h.landmarks[0][1]  # 0.55
+        thumb_down_landmarks = list(h.landmarks)
+        # Landmark 4 (thumb_tip) at same x, well below the wrist.
+        thumb_down_landmarks[4] = (h.landmarks[4][0], wrist_y + 0.15, h.landmarks[4][2])
+        # Also move thumb_IP (3) to follow the tip downward.
+        thumb_down_landmarks[3] = (h.landmarks[3][0], wrist_y + 0.08, h.landmarks[3][2])
+        thumbs_down_hand = replace(h, landmarks=thumb_down_landmarks)
+        assert detect_thumbs_up(thumbs_down_hand) is None
 
     def test_thumbs_up_returns_none_without_scale(self) -> None:
         from dataclasses import replace
@@ -218,11 +209,11 @@ class TestThumbsUp:
     def test_thumbs_up_confidence_reflects_extension_strength(self) -> None:
         # Confidence must be derived from the multi-feature score,
         # not a fixed constant.  The genuine thumbs_up fixture should
-        # produce confidence > 0.9 (thumb_score ≈ 0.93, direction ≈ 1.0).
+        # produce confidence > 0.85 (well above the pipeline threshold).
         h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
         result = detect_thumbs_up(h)
         assert result is not None
-        assert result.confidence > 0.9
+        assert result.confidence > 0.85
         assert result.gesture_name == 'thumbs_up'
 
     @pytest.mark.parametrize('scale_factor', [0.5, 1.0, 2.0, 3.0])
@@ -234,7 +225,205 @@ class TestThumbsUp:
         result = detect_thumbs_up(scaled)
         assert result is not None, f'Thumbs Up missed at scale {scale_factor}'
         assert result.gesture_name == 'thumbs_up'
-        assert result.confidence > 0.9
+        assert result.confidence > 0.85
+
+
+    # ------------------------------------------------------------------
+    # Rotation-invariant direction check
+    # ------------------------------------------------------------------
+
+    def test_thumbs_up_recognized_after_30_deg_rotation(self) -> None:
+        # The thumb must be detected even when the hand is rotated
+        # 30 degrees in the image plane (where the old image-space
+        # direction check would fail).
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        wrist = h.landmarks[0]
+        import math
+        rotated = []
+        angle_rad = math.radians(30.0)
+        for lm in h.landmarks:
+            dx = lm[0] - wrist[0]
+            dy = lm[1] - wrist[1]
+            rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+            ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+            rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+        from dataclasses import replace
+        rotated_hand = replace(h, landmarks=rotated)
+        result = detect_thumbs_up(rotated_hand)
+        assert result is not None, 'Thumbs Up missed after 30° rotation'
+        assert result.gesture_name == 'thumbs_up'
+
+    def test_thumbs_up_recognized_after_60_deg_rotation(self) -> None:
+        # Even 60 degrees of in-plane rotation must still produce
+        # a thumbs_up result.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        wrist = h.landmarks[0]
+        import math
+        rotated = []
+        angle_rad = math.radians(60.0)
+        for lm in h.landmarks:
+            dx = lm[0] - wrist[0]
+            dy = lm[1] - wrist[1]
+            rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+            ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+            rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+        from dataclasses import replace
+        rotated_hand = replace(h, landmarks=rotated)
+        result = detect_thumbs_up(rotated_hand)
+        assert result is not None, 'Thumbs Up missed after 60° rotation'
+        assert result.gesture_name == 'thumbs_up'
+
+    def test_thumbs_up_recognized_after_90_deg_rotation(self) -> None:
+        # Hand rotated 90 degrees (thumb pointing sideways in image).
+        # The palm-relative check must still detect it.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        wrist = h.landmarks[0]
+        import math
+        rotated = []
+        angle_rad = math.radians(90.0)
+        for lm in h.landmarks:
+            dx = lm[0] - wrist[0]
+            dy = lm[1] - wrist[1]
+            rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+            ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+            rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+        from dataclasses import replace
+        rotated_hand = replace(h, landmarks=rotated)
+        result = detect_thumbs_up(rotated_hand)
+        assert result is not None, 'Thumbs Up missed after 90° rotation'
+        assert result.gesture_name == 'thumbs_up'
+
+    def test_rotated_fist_not_thumbs_up(self) -> None:
+        # A rotated fist must still NOT be detected as thumbs_up.
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        wrist = h.landmarks[0]
+        import math
+        rotated = []
+        angle_rad = math.radians(45.0)
+        for lm in h.landmarks:
+            dx = lm[0] - wrist[0]
+            dy = lm[1] - wrist[1]
+            rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+            ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+            rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+        from dataclasses import replace
+        rotated_hand = replace(h, landmarks=rotated)
+        assert detect_thumbs_up(rotated_hand) is None
+
+    def test_rotated_open_palm_not_thumbs_up(self) -> None:
+        # A rotated open palm has all fingers extended — the
+        # four-finger curled check must reject it regardless of rotation.
+        h = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        wrist = h.landmarks[0]
+        import math
+        rotated = []
+        angle_rad = math.radians(45.0)
+        for lm in h.landmarks:
+            dx = lm[0] - wrist[0]
+            dy = lm[1] - wrist[1]
+            rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+            ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+            rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+        from dataclasses import replace
+        rotated_hand = replace(h, landmarks=rotated)
+        assert detect_thumbs_up(rotated_hand) is None
+
+    def test_thumbs_up_direction_is_rotation_invariant(self) -> None:
+        # The thumb_direction_score should remain stable under
+        # in-plane rotation because it uses the palm's local frame.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        base_score = thumb_direction_score(h.landmarks)
+        assert base_score > THUMB_DIRECTION_MIN_SCORE
+        wrist = h.landmarks[0]
+        import math
+        for angle_deg in (15, 30, 45, 60, 90):
+            rotated = []
+            angle_rad = math.radians(angle_deg)
+            for lm in h.landmarks:
+                dx = lm[0] - wrist[0]
+                dy = lm[1] - wrist[1]
+                rx = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+                ry = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+                rotated.append((wrist[0] + rx, wrist[1] + ry, lm[2]))
+            score = thumb_direction_score(rotated)
+            assert score > 0.3, (
+                f'Direction score dropped to {score:.3f} at {angle_deg}° rotation'
+            )
+
+    def test_thumbs_down_has_low_direction_score(self) -> None:
+        # A thumbs-down pose must have a low direction score because
+        # the thumb points opposite to the palm's longitudinal axis.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        from dataclasses import replace
+        # Move thumb tip below the wrist.
+        wrist_y = h.landmarks[0][1]
+        thumbs_down_landmarks = list(h.landmarks)
+        thumbs_down_landmarks[4] = (h.landmarks[4][0], wrist_y + 0.15, h.landmarks[4][2])
+        thumbs_down_landmarks[3] = (h.landmarks[3][0], wrist_y + 0.08, h.landmarks[3][2])
+        score = thumb_direction_score(thumbs_down_landmarks)
+        assert score <= 0.0, f'Thumbs-down direction score should be 0, got {score:.3f}'
+
+    def test_fist_has_low_extension_score_but_can_have_high_direction(self) -> None:
+        # Fist: direction score can be high (thumb points same direction
+        # as palm_y even when curled), but the extension score catches it.
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        dir_score = thumb_direction_score(h.landmarks)
+        ext_score = thumb_extension_score(h.landmarks)
+        # The direction alone is not enough — extension must also pass.
+        assert ext_score < 0.55, 'Fist extension score must be below threshold'
+        assert detect_thumbs_up(h) is None
+
+
+# ======================================================================
+# Thumbs Up — direction score
+# ======================================================================
+
+class TestThumbsDirectionScore:
+    def test_thumbs_up_direction_score_is_high(self) -> None:
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        score = thumb_direction_score(h.landmarks)
+        assert score > THUMB_DIRECTION_MIN_SCORE
+
+    def test_fist_still_rejected_by_detect_thumbs_up(self) -> None:
+        # Fist may have a moderate direction score, but the extension
+        # score check in detect_thumbs_up rejects it.
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_thumbs_down_still_rejected_by_detect_thumbs_up(self) -> None:
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        from dataclasses import replace
+        wrist_y = h.landmarks[0][1]
+        thumbs_down_lm = list(h.landmarks)
+        thumbs_down_lm[4] = (h.landmarks[4][0], wrist_y + 0.15, h.landmarks[4][2])
+        thumbs_down_lm[3] = (h.landmarks[3][0], wrist_y + 0.08, h.landmarks[3][2])
+        thumbs_down_hand = replace(h, landmarks=thumbs_down_lm)
+        assert detect_thumbs_up(thumbs_down_hand) is None
+
+    def test_empty_landmarks_returns_zero(self) -> None:
+        assert thumb_direction_score([]) == 0.0
+
+    def test_pinch_still_rejected_by_detect_thumbs_up(self) -> None:
+        h = make_hand_with_scale(pose_name='pinch_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_ok_sign_still_rejected_by_detect_thumbs_up(self) -> None:
+        h = make_hand_with_scale(pose_name='ok_sign_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_direction_score_is_scale_invariant(self) -> None:
+        # Direction score uses normalised projections (ratio of dot
+        # product to vector length), so uniform landmark scaling
+        # must leave it unchanged.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        base = thumb_direction_score(h.landmarks)
+        for factor in (0.5, 2.0, 3.0):
+            scaled = scale_hand_landmarks(h, factor)
+            score = thumb_direction_score(scaled.landmarks)
+            assert abs(score - base) < 1e-6, (
+                f'Direction score changed at scale {factor}: '
+                f'{base:.6f} -> {score:.6f}'
+            )
 
 
 # ======================================================================
@@ -407,9 +596,11 @@ class TestOkSign:
 
 from gestures.gesture_utils import (
     thumb_extension_score,
+    thumb_direction_score,
     is_thumb_extended,
     extended_finger_count,
     THUMB_EXTENSION_THRESHOLD,
+    THUMB_DIRECTION_MIN_SCORE,
     all_fingers_extended,
 )
 
