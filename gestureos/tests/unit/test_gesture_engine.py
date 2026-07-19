@@ -53,15 +53,16 @@ class TestEngineConstruction:
 # ======================================================================
 
 class TestStaticRuleRegistry:
-    def test_static_registry_has_eight_rules(self) -> None:
-        # 8 static gestures per PRD §4.3.
-        assert len(STATIC_GESTURE_RULES) == 8
+    def test_static_registry_has_ten_rules(self) -> None:
+        # 10 static gestures (8 original + one_finger + four_fingers).
+        assert len(STATIC_GESTURE_RULES) == 10
 
     def test_static_registry_names_match_prd(self) -> None:
         # Every static recognizer must match its PRD name exactly.
         expected = {
             'open_palm', 'fist', 'pinch', 'thumbs_up',
             'thumbs_down', 'peace_sign', 'three_fingers', 'ok_sign',
+            'one_finger', 'four_fingers',
         }
         # We can't import recognizers by name in the test without
         # inspecting their docstrings; instead, run each recognizer
@@ -419,6 +420,74 @@ class TestMediaPipeIntegration:
         # MP should NOT have been called.
         mock_mgr.recognize_gesture.assert_not_called()
         assert candidates == []
+
+
+class TestMpPinchConflict:
+    """GestureFuser must not let MP Thumb_Up unconditionally override
+    a custom pinch candidate (CP-3 pinch audit fix)."""
+
+    def test_pinch_wins_over_mp_thumbs_up(self) -> None:
+        """When the custom recognizer produces `pinch` and the MP model
+        returns `thumbs_up` at high confidence for the same role, pinch
+        must win (the custom recognizer is authoritative for our gesture
+        set)."""
+        from gestures.gesture_fuser import GestureFuser
+
+        custom_pinch = GestureResult(
+            gesture_name='pinch', confidence=0.88, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='unknown',
+        )
+        mp_thumbs_up = GestureResult(
+            gesture_name='thumbs_up', confidence=0.85, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='mediapipe',
+        )
+
+        winners = GestureFuser().resolve([custom_pinch, mp_thumbs_up])
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'pinch', (
+            f'Expected pinch, got {winners[0].gesture_name}'
+        )
+
+    def test_mp_thumbs_up_still_wins_without_custom_pinch(self) -> None:
+        """When there is no custom pinch candidate, MP Thumb_Up at
+        high confidence still wins unconditionally (original rule
+        preserved for genuine thumbs-up)."""
+        from gestures.gesture_fuser import GestureFuser
+
+        custom_fist = GestureResult(
+            gesture_name='fist', confidence=0.70, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='unknown',
+        )
+        mp_thumbs_up = GestureResult(
+            gesture_name='thumbs_up', confidence=0.85, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='mediapipe',
+        )
+
+        winners = GestureFuser().resolve([custom_fist, mp_thumbs_up])
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'thumbs_up', (
+            f'Expected thumbs_up, got {winners[0].gesture_name}'
+        )
+
+    def test_mp_thumbs_up_below_threshold_removed(self) -> None:
+        """Low-confidence MP Thumb_Up must be removed regardless of
+        custom pinch existence."""
+        from gestures.gesture_fuser import GestureFuser
+
+        custom_pinch = GestureResult(
+            gesture_name='pinch', confidence=0.88, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='unknown',
+        )
+        mp_low = GestureResult(
+            gesture_name='thumbs_up', confidence=0.70, is_dynamic=False,
+            hand_role='HAND_A', timestamp=100.0, source='mediapipe',
+        )
+
+        winners = GestureFuser().resolve([custom_pinch, mp_low])
+        assert len(winners) == 1
+        assert winners[0].gesture_name == 'pinch', (
+            f'Expected pinch, got {winners[0].gesture_name}'
+        )
 
 
 # Local helper needed for the all-candidates test

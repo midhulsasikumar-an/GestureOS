@@ -245,14 +245,17 @@ def thumb_extension_score(
                     + 0.2 * score_separation)
 
     # Penalise when only one feature is strongly active (multi-feature
-    # guard against transitional false positives).
+    # guard against transitional false positives). The 0.75 multiplier
+    # is less aggressive than the original 0.5, reducing false rejections
+    # for genuine thumbs-up where two features are at the activity
+    # boundary while keeping the guard meaningful.
     active_features = sum([
         score_reach > 0.2,
         score_length > 0.2,
         score_separation > 0.2,
     ])
     if active_features < 2:
-        overall_score *= 0.5
+        overall_score *= 0.75
 
     return float(max(0.0, min(1.0, overall_score)))
 

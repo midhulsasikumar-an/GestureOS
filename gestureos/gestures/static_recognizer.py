@@ -43,6 +43,7 @@ from gestures.gesture_utils import (
     finger_states,
     fist_compactness_ratio,
     is_thumb_extended,
+    pinch_distance_ratio,
     remaining_fingers_curled_score,
     thumb_direction_score,
     thumb_extension_score,
@@ -396,12 +397,23 @@ def detect_thumbs_up(hand: HandData) -> GestureResult | None:
     if direction_score <= 0.0:
         return None  # not pointing up along the palm's longitudinal axis
 
-    # Confidence blends extension strength and direction clarity.
-    # For a genuine thumbs-up (thumb_score ≈ 0.93, direction ≈ 1.0)
-    # the result is ≈ 0.97, well above the BOOLEAN_GESTURE_CONFIDENCE
-    # floor; a transitional pose scores lower so ConflictResolver
-    # can prefer a more specific gesture (e.g. fist at 0.92).
-    confidence = 0.6 + 0.4 * thumb_score * direction_score
+    # Pinch proximity guard: if the thumb tip is close to the index tip
+    # (below the pinch threshold), the hand is forming a pinch, not a
+    # thumbs-up — return None so Pinch wins in GestureFuser.
+    raw_dist = euclidean_distance(hand.landmarks[THUMB_TIP], hand.landmarks[INDEX_TIP])
+    norm_dist = raw_dist / hand.scale.palm_width
+    if norm_dist < PINCH_NORMALIZED_DISTANCE_THRESHOLD:
+        return None
+
+    # Confidence blends extension strength (dominant) with direction clarity
+    # (secondary modifier).  Direction no longer multiplies the entire
+    # variable contribution — moderate direction (≈0.3–0.6) no longer
+    # heavily punishes an otherwise correct thumbs-up.
+    #
+    # Structure: 50% floor + variable portion split 80/20 between
+    # extension and direction.  This gives thumb_score ≈4× the weight of
+    # direction_score in the final confidence.
+    confidence = 0.5 + 0.5 * (0.80 * thumb_score + 0.20 * direction_score)
 
     return GestureResult(
         gesture_name='thumbs_up',
@@ -585,13 +597,83 @@ def detect_ok_sign(hand: HandData) -> GestureResult | None:
     if not (states['middle'] and states['ring'] and states['pinky']):
         return None
 
-    # Confidence: same gradient as Pinch — descending from 1.0 at
-    # zero distance to 0.0 at the threshold.
-    confidence = 1.0 - (normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD)
+    # Confidence: blended — 0.6 floor from the two binary gates
+    # (distance + finger-state) plus the proximity gradient up to 0.4
+    # additional (same structure as Pinch).
+    distance_score = max(
+        0.0,
+        1.0 - normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD,
+    )
+    confidence = 0.6 + 0.4 * distance_score
 
     return GestureResult(
         gesture_name='ok_sign',
         confidence=float(confidence),
+        is_dynamic=False,
+        hand_role=hand.role if hand.role is not None else '',
+        timestamp=time.time(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. One Finger (Pointing)
+# ---------------------------------------------------------------------------
+
+def detect_one_finger(hand: HandData) -> GestureResult | None:
+    """Recognize the One Finger (Pointing) gesture: index EXTENDED,
+    middle + ring + pinky CURLED, thumb CURLED (PRD §4.3 rule summary).
+
+    Default action: Point / Select.
+
+    Signals used: per-finger pattern (Priority 1) + cross-finger
+    consistency (Priority 1). Two independent signals per PRD FR-MS-01.
+    """
+    if not _has_min_landmarks(hand) or hand.scale is None:
+        return None  # PRD FR-SC-04
+
+    states = finger_states(hand.landmarks)
+    if not states['index']:
+        return None
+    if states['middle'] or states['ring'] or states['pinky']:
+        return None
+    if is_thumb_extended(hand.landmarks, hand.chirality):
+        return None
+
+    return GestureResult(
+        gesture_name='one_finger',
+        confidence=BOOLEAN_GESTURE_CONFIDENCE,
+        is_dynamic=False,
+        hand_role=hand.role if hand.role is not None else '',
+        timestamp=time.time(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. Four Fingers
+# ---------------------------------------------------------------------------
+
+def detect_four_fingers(hand: HandData) -> GestureResult | None:
+    """Recognize the Four Fingers gesture: index + middle + ring + pinky
+    EXTENDED, thumb CURLED (PRD §4.3 rule summary).
+
+    Default action: Switch Tool.
+
+    Signals used: per-finger pattern (Priority 1, explicit four-finger
+    pattern) + cross-finger consistency (Priority 1). Two independent
+    signals per PRD FR-MS-01.
+    """
+    if not _has_min_landmarks(hand) or hand.scale is None:
+        return None  # PRD FR-SC-04
+
+    states = finger_states(hand.landmarks)
+    if not (states['index'] and states['middle'] and states['ring'] and states['pinky']):
+        return None
+    if is_thumb_extended(hand.landmarks, hand.chirality):
+        return None
+
+    return GestureResult(
+        gesture_name='four_fingers',
+        confidence=BOOLEAN_GESTURE_CONFIDENCE,
         is_dynamic=False,
         hand_role=hand.role if hand.role is not None else '',
         timestamp=time.time(),
@@ -605,17 +687,23 @@ def detect_ok_sign(hand: HandData) -> GestureResult | None:
 # ---------------------------------------------------------------------------
 
 STATIC_GESTURE_RULES: tuple = (
+    detect_one_finger,
+    detect_peace_sign,
+    detect_three_fingers,
+    detect_four_fingers,
     detect_open_palm,
     detect_fist,
     detect_pinch,
     detect_thumbs_up,
     detect_thumbs_down,
-    detect_peace_sign,
-    detect_three_fingers,
     detect_ok_sign,
 )
-"""All 8 static-gesture detection functions. Each returns `GestureResult`
+"""All 10 static-gesture detection functions. Each returns `GestureResult`
 or `None`. `GestureEngine._check_all_static` iterates this tuple and
 collects every non-None result into the candidate list (TRD §3.9
 "first-match-wins is now explicitly replaced by all-candidates
-generation")."""
+generation").
+
+Ordered from most specific (fewest extended fingers) to most general
+(many extended fingers) so that the candidate list is naturally sorted
+for GestureFuser's confidence comparison."""

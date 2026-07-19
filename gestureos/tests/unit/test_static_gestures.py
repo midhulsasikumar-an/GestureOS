@@ -11,13 +11,16 @@ from __future__ import annotations
 import pytest
 
 from gestures.static_recognizer import (
+    BOOLEAN_GESTURE_CONFIDENCE,
     FIST_COMPACTNESS_THRESHOLD,
     PINCH_ALIGNMENT_THRESHOLD,
     PINCH_NORMALIZED_DISTANCE_THRESHOLD,
     PINCH_REMAINING_CURL_THRESHOLD,
     STATIC_GESTURE_RULES,
     detect_fist,
+    detect_four_fingers,
     detect_ok_sign,
+    detect_one_finger,
     detect_open_palm,
     detect_pinch,
     detect_peace_sign,
@@ -43,8 +46,8 @@ class TestConstants:
         # is 0.35 in `palm_width`-normalized units. Pin any future tuning.
         assert PINCH_NORMALIZED_DISTANCE_THRESHOLD == 0.35
 
-    def test_static_rules_count_is_eight(self) -> None:
-        assert len(STATIC_GESTURE_RULES) == 8
+    def test_static_rules_count_is_ten(self) -> None:
+        assert len(STATIC_GESTURE_RULES) == 10
 
     def test_fist_compactness_threshold_pinned(self) -> None:
         assert FIST_COMPACTNESS_THRESHOLD == 1.5
@@ -226,6 +229,68 @@ class TestThumbsUp:
         assert result is not None, f'Thumbs Up missed at scale {scale_factor}'
         assert result.gesture_name == 'thumbs_up'
         assert result.confidence > 0.85
+
+    def test_thumbs_up_confidence_formula_weights_extension_over_direction(
+        self,
+    ) -> None:
+        """The confidence formula must weight thumb extension ≈4×
+        more than direction (80/20 split).  Verify two equal-score
+        scenarios produce the correct confidence values."""
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        result = detect_thumbs_up(h)
+        assert result is not None
+        # Canonical fixture: thumb=0.9334, dir=0.7000
+        # new formula: 0.5 + 0.5 * (0.80*0.9334 + 0.20*0.7000) = 0.9434
+        assert round(result.confidence, 4) == 0.9434, (
+            f'Expected 0.9434, got {result.confidence}'
+        )
+
+    def test_thumbs_up_confidence_tolerates_moderate_direction(
+        self,
+    ) -> None:
+        """A scenario with moderate direction (≈0.35) and good
+        extension (≈0.81) must still pass the 0.85 threshold."""
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.thumb_extension_score',
+            return_value=0.814,
+        ), mock.patch(
+            'gestures.static_recognizer.thumb_direction_score',
+            return_value=0.354,
+        ):
+            result = detect_thumbs_up(h)
+        assert result is not None
+        # 0.5 + 0.5 * (0.80 * 0.814 + 0.20 * 0.354) = 0.861
+        assert round(result.confidence, 4) == 0.8610, (
+            f'Expected 0.8610, got {result.confidence}'
+        )
+
+    def test_thumbs_up_confidence_does_not_overweight_direction(
+        self,
+    ) -> None:
+        """A case with poor direction (≤0.05) and good extension
+        must still pass the 0.85 threshold — direction should not
+        dominate confidence."""
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.thumb_extension_score',
+            return_value=0.814,
+        ), mock.patch(
+            'gestures.static_recognizer.thumb_direction_score',
+            return_value=0.05,
+        ):
+            result = detect_thumbs_up(h)
+        assert result is not None
+        # 0.5 + 0.5 * (0.80 * 0.814 + 0.20 * 0.05) = 0.830
+        # Still below 0.85 threshold — the binary gate would have
+        # already let this through (dir > 0.0), but the secondary
+        # confidence check ensures very poor direction doesn't
+        # produce a strongly confident result.
+        assert round(result.confidence, 4) == 0.8306, (
+            f'Expected 0.8306, got {result.confidence}'
+        )
 
 
     # ------------------------------------------------------------------
@@ -595,6 +660,12 @@ class TestOkSign:
 # ======================================================================
 
 from gestures.gesture_utils import (
+    INDEX_MCP,
+    THUMB_CMC,
+    THUMB_MCP,
+    THUMB_TIP,
+    WRIST,
+    euclidean_distance,
     thumb_extension_score,
     thumb_direction_score,
     is_thumb_extended,
@@ -721,6 +792,181 @@ class TestThumbExtensionScore:
         rotated_hand = replace(h, landmarks=rotated)
         assert detect_thumbs_up(rotated_hand) is None
 
+    def test_penalty_multiplier_reduced_to_0_75(self) -> None:
+        # The multi-feature guard penalty multiplier was reduced from 0.5
+        # to 0.75 (audit fix).  For poses with exactly 1 active feature
+        # the penalised score must equal unpenalized * 0.75, confirming
+        # the less-aggressive penalty is in place.
+        # ok_sign_right has active=1 (only score_length > 0.2).
+        h = make_hand_with_scale(pose_name='ok_sign_right', role='HAND_A')
+        lm = h.landmarks
+        w = lm[WRIST]; mc = lm[THUMB_MCP]; ti = lm[THUMB_TIP]
+        idx = lm[INDEX_MCP]; cmc = lm[THUMB_CMC]
+        w2mc = euclidean_distance(w, mc)
+        w2ti = euclidean_distance(w, ti)
+        reach_r = w2ti / w2mc if w2mc > 0 else 0
+        score_r = max(0.0, min(1.0, (reach_r - 1.0) / 1.0))
+        cmc2mc = euclidean_distance(cmc, mc)
+        mc2ti = euclidean_distance(mc, ti)
+        len_r = mc2ti / cmc2mc if cmc2mc > 0 else 0
+        score_l = max(0.0, min(1.0, (len_r - 0.25) / 1.25))
+        ti2idx = euclidean_distance(ti, idx)
+        sep_r = ti2idx / w2mc if w2mc > 0 else 0
+        score_s = max(0.0, min(1.0, (sep_r - 0.5) / 2.0))
+        active = sum([score_r > 0.2, score_l > 0.2, score_s > 0.2])
+        unpen = 0.5 * score_r + 0.3 * score_l + 0.2 * score_s
+        final_score = thumb_extension_score(lm)
+        assert active == 1, f'Expected 1 active feature, got {active}'
+        expected = unpen * 0.75
+        assert abs(final_score - expected) < 1e-4, (
+            f'Penalty multiplier mismatch: expected {unpen:.4f} * 0.75 = {expected:.4f}, '
+            f'got {final_score:.4f}'
+        )
+        # The reduced penalty produces a higher score than the old 0.5:
+        old_penalty = unpen * 0.5
+        assert final_score > old_penalty, (
+            f'New penalty ({final_score:.4f}) must be higher than old ({old_penalty:.4f})'
+        )
+        # But ok_sign should still be well below the extension threshold
+        # (this pose is NOT a thumbs-up):
+        assert final_score < THUMB_EXTENSION_THRESHOLD, (
+            f'ok_sign score {final_score:.4f} must stay below {THUMB_EXTENSION_THRESHOLD}'
+        )
+
+    def test_fist_still_rejected_with_penalty_change(self) -> None:
+        # Fist has active=2 features, so the penalty does NOT apply.
+        # Its score must remain well below THUMB_EXTENSION_THRESHOLD,
+        # proving the penalty change does not create false positives.
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        score = thumb_extension_score(h.landmarks)
+        assert score < THUMB_EXTENSION_THRESHOLD, (
+            f'Fist score {score:.4f} must stay below {THUMB_EXTENSION_THRESHOLD}'
+        )
+        assert detect_thumbs_up(h) is None, 'Fist must not be detected as thumbs_up'
+
+    def test_canonical_thumbs_up_passes_with_penalty_change(self) -> None:
+        # Canonical thumbs-up has active=3, no penalty applies.
+        # It must still pass detect_thumbs_up.
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        assert detect_thumbs_up(h) is not None
+        assert detect_thumbs_up(h).gesture_name == 'thumbs_up'
+
+
+# ======================================================================
+# One Finger (Pointing)
+# ======================================================================
+
+class TestOneFinger:
+    def test_one_finger_detected(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='peace_sign_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': True, 'middle': False, 'ring': False, 'pinky': False},
+        ), mock.patch(
+            'gestures.static_recognizer.is_thumb_extended',
+            return_value=False,
+        ):
+            result = detect_one_finger(h)
+        assert result is not None
+        assert result.gesture_name == 'one_finger'
+        assert result.confidence == BOOLEAN_GESTURE_CONFIDENCE
+
+    def test_one_finger_rejects_index_curled(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': False, 'middle': False, 'ring': False, 'pinky': False},
+        ):
+            assert detect_one_finger(h) is None
+
+    def test_one_finger_rejects_thumb_extended(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': True, 'middle': False, 'ring': False, 'pinky': False},
+        ), mock.patch(
+            'gestures.static_recognizer.is_thumb_extended',
+            return_value=True,
+        ):
+            assert detect_one_finger(h) is None
+
+    def test_one_finger_returns_none_without_scale(self) -> None:
+        from dataclasses import replace
+        h = make_hand_with_scale(pose_name='peace_sign_right', role='HAND_A')
+        assert detect_one_finger(replace(h, scale=None)) is None
+
+
+# ======================================================================
+# Four Fingers
+# ======================================================================
+
+class TestFourFingers:
+    def test_four_fingers_detected(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': True, 'middle': True, 'ring': True, 'pinky': True},
+        ), mock.patch(
+            'gestures.static_recognizer.is_thumb_extended',
+            return_value=False,
+        ):
+            result = detect_four_fingers(h)
+        assert result is not None
+        assert result.gesture_name == 'four_fingers'
+        assert result.confidence == BOOLEAN_GESTURE_CONFIDENCE
+
+    def test_four_fingers_rejects_any_curled(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='peace_sign_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': True, 'middle': True, 'ring': False, 'pinky': False},
+        ):
+            assert detect_four_fingers(h) is None
+
+    def test_four_fingers_rejects_thumb_extended(self) -> None:
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.finger_states',
+            return_value={'index': True, 'middle': True, 'ring': True, 'pinky': True},
+        ), mock.patch(
+            'gestures.static_recognizer.is_thumb_extended',
+            return_value=True,
+        ):
+            assert detect_four_fingers(h) is None
+
+    def test_four_fingers_returns_none_without_scale(self) -> None:
+        from dataclasses import replace
+        h = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        assert detect_four_fingers(replace(h, scale=None)) is None
+
+
+# ======================================================================
+# Pinch proximity guard (Thumbs Up should NOT fire during pinch)
+# ======================================================================
+
+class TestPinchThumbsUpMutualExclusivity:
+    def test_pinch_fixture_not_detected_as_thumbs_up(self) -> None:
+        """A canonical Pinch fixture must not trigger Thumbs Up
+        (thumb-index distance below pinch threshold)."""
+        h = make_hand_with_scale(pose_name='pinch_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_ok_sign_fixture_not_detected_as_thumbs_up(self) -> None:
+        """An OK Sign fixture must not trigger Thumbs Up
+        (thumb-index distance below pinch threshold)."""
+        from gestures.gesture_utils import pinch_distance_ratio
+        h = make_hand_with_scale(pose_name='ok_sign_right', role='HAND_A')
+        # Verify the fixture actually has close thumb-index distance
+        nd = pinch_distance_ratio(h.landmarks, h.scale.palm_width)
+        assert nd < 0.35, f'OK Sign fixture must have close tips (got {nd})'
+        assert detect_thumbs_up(h) is None
+
 
 # ======================================================================
 # Hot-path-never-raises discipline (RULES §6.4)
@@ -728,13 +974,15 @@ class TestThumbExtensionScore:
 
 class TestHotPathNeverRaises:
     @pytest.mark.parametrize('recognizer', [
+        detect_one_finger,
+        detect_peace_sign,
+        detect_three_fingers,
+        detect_four_fingers,
         detect_open_palm,
         detect_fist,
         detect_pinch,
         detect_thumbs_up,
         detect_thumbs_down,
-        detect_peace_sign,
-        detect_three_fingers,
         detect_ok_sign,
     ])
     def test_malformed_landmarks_returns_none(self, recognizer) -> None:

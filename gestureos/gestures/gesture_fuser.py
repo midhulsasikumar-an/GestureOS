@@ -39,20 +39,23 @@ logger = logging.getLogger('gestureos')
 MEDIAPIPE_WIN_CONFIDENCE: float = 0.80
 
 GESTURE_TIE_BREAK_PRIORITY: dict[str, int] = {
-    'pinch': 0,
-    'ok_sign': 0,
-    'thumbs_up': 1,
-    'thumbs_down': 1,
-    'peace_sign': 2,
-    'three_fingers': 3,
-    'fist': 4,
-    'open_palm': 5,
-    'wave': 6,
-    'circular_motion': 7,
-    'swipe_right': 8,
-    'swipe_left': 8,
-    'swipe_up': 8,
-    'swipe_down': 8,
+    'pointing_up': 0,
+    'one_finger': 0,
+    'pinch': 1,
+    'ok_sign': 1,
+    'thumbs_up': 2,
+    'thumbs_down': 2,
+    'peace_sign': 3,
+    'three_fingers': 4,
+    'four_fingers': 5,
+    'fist': 6,
+    'open_palm': 7,
+    'wave': 8,
+    'circular_motion': 9,
+    'swipe_right': 10,
+    'swipe_left': 10,
+    'swipe_up': 10,
+    'swipe_down': 10,
 }
 
 
@@ -116,7 +119,10 @@ class GestureFuser:
         # ---------------------------------------------------------------
         # 1. If a MediaPipe candidate has confidence >=
         #    MEDIAPIPE_WIN_CONFIDENCE (0.80), it wins unconditionally
-        #    over all custom candidates for this role.
+        #    over all custom candidates for this role, *unless* a
+        #    custom candidate represents a more specific gesture that
+        #    the MP model tends to misclassify (e.g., MP classifies a
+        #    deliberate pinch as Thumb_Up).
         # 2. If MediaPipe exists but confidence < threshold, remove
         #    the MediaPipe candidate from consideration and let the
         #    custom recognizers compete among themselves.
@@ -128,9 +134,25 @@ class GestureFuser:
         ]
         if mp_candidates:
             mp = mp_candidates[0]
-            if mp.confidence >= MEDIAPIPE_WIN_CONFIDENCE:
+            mp_should_win = mp.confidence >= MEDIAPIPE_WIN_CONFIDENCE
+
+            # Pinch exception: MediaPipe's model frequently classifies
+            # a deliberate pinch as Thumb_Up because both gestures
+            # share an extended-thumb + curled-fingers profile. When
+            # the custom recognizer detects pinch for the same role,
+            # it is the authoritative source — do not let MP override
+            # unconditionally.
+            if mp_should_win:
+                custom_names = {
+                    c.gesture_name for c in role_candidates
+                    if getattr(c, 'source', '') != 'mediapipe'
+                }
+                if mp.gesture_name == 'thumbs_up' and 'pinch' in custom_names:
+                    mp_should_win = False
+
+            if mp_should_win:
                 return mp
-            # Low-confidence MP: remove from consideration.
+            # Low-confidence MP or exception: remove from consideration.
             remaining = [
                 c for c in role_candidates
                 if c.source != 'mediapipe'

@@ -197,14 +197,19 @@ class TestRecognizeGesture:
                 mgr.load_gesture_recognizer()
                 return mock_model
 
+    def _set_latest_frame(self, mgr) -> None:
+        import numpy as np
+        mgr._latest_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
     def test_recognize_success(self, mgr) -> None:
         mock_model = self._load_gesture_model(mgr)
+        self._set_latest_frame(mgr)
 
         mock_category = MagicMock()
         mock_category.category_name = 'Open_Palm'
         mock_category.score = 0.92
         mock_result = MagicMock()
-        mock_result.gestures = [mock_category]
+        mock_result.gestures = [[mock_category]]
         mock_model.recognize.return_value = mock_result
 
         result = mgr.recognize_gesture([(0.5, 0.5, 0.0)] * 21)
@@ -216,6 +221,7 @@ class TestRecognizeGesture:
 
     def test_recognize_returns_none_on_inference_error(self, mgr) -> None:
         mock_model = self._load_gesture_model(mgr)
+        self._set_latest_frame(mgr)
 
         mock_model.recognize.side_effect = RuntimeError('inference failed')
         result = mgr.recognize_gesture([(0.5, 0.5, 0.0)] * 21)
@@ -224,6 +230,7 @@ class TestRecognizeGesture:
 
     def test_recognize_returns_none_when_no_gestures(self, mgr) -> None:
         mock_model = self._load_gesture_model(mgr)
+        self._set_latest_frame(mgr)
 
         mock_result = MagicMock()
         mock_result.gestures = []
@@ -233,13 +240,14 @@ class TestRecognizeGesture:
 
     def test_gesture_name_mapping_all_entries(self, mgr) -> None:
         mock_model = self._load_gesture_model(mgr)
+        self._set_latest_frame(mgr)
 
         for mp_name, internal_name in _MP_TO_INTERNAL.items():
             mock_category = MagicMock()
             mock_category.category_name = mp_name
             mock_category.score = 0.90
             mock_result = MagicMock()
-            mock_result.gestures = [mock_category]
+            mock_result.gestures = [[mock_category]]
             mock_model.recognize.return_value = mock_result
 
             result = mgr.recognize_gesture([(0.5, 0.5, 0.0)] * 21)

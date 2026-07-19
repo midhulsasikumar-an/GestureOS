@@ -99,6 +99,10 @@ class ModelManager:
         self._hl_min_tracking_confidence: float = 0.5
         # Monotonically increasing timestamp (ms) for VIDEO mode.
         self._hl_timestamp_ms: int = 0
+        # Cached RGB frame from the most recent Hand Landmarker call,
+        # used by the Gesture Recognizer which requires image input
+        # (MediaPipe Tasks API contract).
+        self._latest_frame: np.ndarray | None = None
 
     # -- Singleton ----------------------------------------------------------
 
@@ -296,6 +300,11 @@ class ModelManager:
         try:
             import mediapipe as mp
 
+            # Cache the frame for the Gesture Recognizer, which runs on
+            # the same frame later in the pipeline but doesn't receive
+            # it directly (MediaPipe Tasks API requires mp.Image input).
+            self._latest_frame = frame
+
             # Monotonically increasing timestamp (ms) per VIDEO mode contract.
             # Using time.monotonic() ensures strict monotonicity even when the
             # system clock jumps.
@@ -409,12 +418,18 @@ class ModelManager:
         counter is incremented; auto-reload is triggered after
         `MAX_CONSECUTIVE_FAILURES`.
 
+        The Gesture Recognizer (``gesture_recognizer.task``) is a
+        MediaPipe Tasks API model that expects ``mp.Image`` input,
+        not raw landmarks. The latest RGB frame is obtained from the
+        cache populated by :meth:`process_hand_landmarker`, which runs
+        earlier in the same frame cycle.
+
         Args:
             landmarks: list of 21 normalized (x, y, z) MediaPipe
-                landmarks produced by the Hand Landmarker. Other
-                shapes are passed through and may fail inside
-                MediaPipe; the resulting exception is caught and
-                converted to None.
+                landmarks produced by the Hand Landmarker. Used to
+                match which detected hand in the GestureRecognizer
+                result corresponds to the caller's hand (multi-hand
+                support).
 
         Returns:
             A `GestureResult` (gesture_name, confidence,
@@ -430,9 +445,17 @@ class ModelManager:
 
         if not self.is_gesture_model_available():
             return None
+        if self._latest_frame is None:
+            return None
 
         try:
-            result = self._gesture_model.recognize(landmarks)  # type: ignore[union-attr]
+            import mediapipe as mp
+
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=self._latest_frame,
+            )
+            result = self._gesture_model.recognize(mp_image)
         except Exception as exc:  # noqa: BLE001 — hot-path defensive
             logger.error(
                 'ml',
@@ -447,15 +470,42 @@ class ModelManager:
         self._consecutive_failures = 0
 
         # The MediaPipe result is a `GestureRecognizerResult`
-        # namedtuple with `gestures: list[Category]`, where
+        # with:
+        #   gestures: list[list[Category]]
+        #     outer list = per hand, inner list = per category score
+        #   hand_landmarks: list[list[NormalizedLandmark]]
+        #     outer list = per hand, inner list = 21 landmarks
         # `Category.category_name` is the class string and
         # `Category.score` is the confidence. We pick the
-        # top-scoring gesture; if none, return None.
+        # top-scoring gesture for the hand that best matches the
+        # caller's landmarks; if none, return None.
         mp_gestures = getattr(result, 'gestures', None) or []
+        mp_hand_landmarks = getattr(result, 'hand_landmarks', None) or []
+
         if not mp_gestures:
             return None
 
-        top = mp_gestures[0]
+        # Match the caller's hand to a detected hand by comparing
+        # wrist positions (landmarks[0]). For a single detected hand
+        # this is trivial; for multiple hands we pick the closest.
+        caller_wrist = (landmarks[0][0], landmarks[0][1]) if landmarks else None
+        hand_idx = 0
+        if caller_wrist is not None and len(mp_gestures) > 1 and len(mp_hand_landmarks) >= len(mp_gestures):
+            best_dist = float('inf')
+            for i in range(len(mp_gestures)):
+                if i < len(mp_hand_landmarks) and mp_hand_landmarks[i]:
+                    dw = mp_hand_landmarks[i][0]
+                    dx = caller_wrist[0] - dw.x
+                    dy = caller_wrist[1] - dw.y
+                    dist = dx * dx + dy * dy
+                    if dist < best_dist:
+                        best_dist = dist
+                        hand_idx = i
+
+        cat_list = mp_gestures[hand_idx]
+        if not cat_list:
+            return None
+        top = cat_list[0]
         if not getattr(top, 'category_name', None):
             return None
 
