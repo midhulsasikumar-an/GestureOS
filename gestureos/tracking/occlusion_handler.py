@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import Iterable
 
 from models.data_models import HandData
 from tracking.hand_landmarker import REASON_OCCLUSION_BRIDGE, STATUS_RETAINED

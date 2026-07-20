@@ -41,6 +41,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import PYQT6_AVAILABLE
+
 from gestures.activation_gate import (
     DEFAULT_HOLD_DURATION_S,
     OPEN_PALM_GESTURE,
@@ -323,6 +325,10 @@ class TestPipelineOrdering:
 # ======================================================================
 
 class TestCaptureThreadUnwired:
+    pytestmark = pytest.mark.skipif(
+        not PYQT6_AVAILABLE, reason='PyQt6 not installed'
+    )
+
     """`CaptureThread.pipeline_wired == False` must continue to emit
     an empty `gesture_detected` list per frame, preserving the CP-1
     behavior where the gesture pipeline was not yet wired."""

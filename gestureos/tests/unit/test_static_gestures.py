@@ -41,10 +41,13 @@ from tests.conftest import (
 # ======================================================================
 
 class TestConstants:
-    def test_pinch_threshold_is_0_35(self) -> None:
-        # PRD §4.3 / §5.2 worked example: the canonical Pinch threshold
-        # is 0.35 in `palm_width`-normalized units. Pin any future tuning.
-        assert PINCH_NORMALIZED_DISTANCE_THRESHOLD == 0.35
+    def test_pinch_threshold_is_0_55(self) -> None:
+        # CP-3 pinch audit: increased from 0.35 to 0.55 so that
+        # real-world pinch distances (nd ≈ 0.15–0.35, dominated by
+        # MediaPipe landmark noise) clear the distance gate and the
+        # confidence formula produces values ≥0.85 for nd ≤ 0.30.
+        # Open Palm (nd ≈ 0.68) and Fist (nd ≈ 0.67) remain rejected.
+        assert PINCH_NORMALIZED_DISTANCE_THRESHOLD == 0.55
 
     def test_static_rules_count_is_ten(self) -> None:
         assert len(STATIC_GESTURE_RULES) == 10
@@ -161,6 +164,34 @@ class TestPinch:
         result = detect_pinch(scaled)
         assert result is not None, f'Pinch missed at scale {scale_factor}'
         assert result.confidence > 0.5
+
+    def test_pinch_confidence_above_threshold_for_moderate_distance(self) -> None:
+        """A natural pinch with normalized distance up to ~0.30 must
+        produce confidence >= 0.85 (the pipeline's global threshold),
+        so it is not silently dropped before GestureFuser."""
+        h = make_hand_with_scale(pose_name='pinch_right', role='HAND_A')
+        from dataclasses import replace
+        from gestures.gesture_utils import THUMB_TIP, INDEX_TIP, euclidean_distance
+        mod = list(h.landmarks)
+        # Push thumb tip outward along its current direction from the
+        # wrist so the normalized distance reaches ~0.30.
+        target_raw = 0.30 * h.scale.palm_width
+        current_raw = euclidean_distance(mod[THUMB_TIP], mod[INDEX_TIP])
+        wx, wy, _ = mod[0]  # WRIST
+        tx, ty, tz = mod[THUMB_TIP]
+        vx, vy = tx - wx, ty - wy
+        vlen = (vx * vx + vy * vy) ** 0.5
+        if vlen > 1e-8:
+            factor = 1.0 + (target_raw - current_raw) / vlen
+            mod[THUMB_TIP] = (wx + vx * factor, wy + vy * factor, tz)
+        h_mod = replace(h, landmarks=tuple(mod))
+        from gestures.gesture_utils import pinch_distance_ratio
+        nd = pinch_distance_ratio(h_mod.landmarks, h_mod.scale.palm_width)
+        result = detect_pinch(h_mod)
+        assert result is not None, f'Pinch missed at nd={nd:.4f}'
+        assert result.confidence >= 0.85, (
+            f'Pinch confidence {result.confidence:.4f} below 0.85 at nd={nd:.4f}'
+        )
 
 
 # ======================================================================
@@ -962,9 +993,11 @@ class TestPinchThumbsUpMutualExclusivity:
         (thumb-index distance below pinch threshold)."""
         from gestures.gesture_utils import pinch_distance_ratio
         h = make_hand_with_scale(pose_name='ok_sign_right', role='HAND_A')
-        # Verify the fixture actually has close thumb-index distance
+        # Verify the fixture actually has close thumb-index distance.
         nd = pinch_distance_ratio(h.landmarks, h.scale.palm_width)
-        assert nd < 0.35, f'OK Sign fixture must have close tips (got {nd})'
+        assert nd < PINCH_NORMALIZED_DISTANCE_THRESHOLD, (
+            f'OK Sign fixture must have close tips (got {nd})'
+        )
         assert detect_thumbs_up(h) is None
 
 

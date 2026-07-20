@@ -23,8 +23,7 @@ candidates. Selection between competing candidates is the job of
 from __future__ import annotations
 
 import logging
-import time
-from typing import Any, Iterable
+from typing import Any
 
 from gestures.dynamic_recognizer import DYNAMIC_GESTURE_RULES
 from gestures.motion_history_service import MotionHistoryService

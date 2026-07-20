@@ -29,7 +29,7 @@ from overlay.debug_panel import (
 )
 from models.data_models import HandData, HandScale
 
-from tests.conftest import load_fixture, make_hand_with_scale
+from tests.conftest import load_fixture, make_hand_with_scale, PYQT6_AVAILABLE
 
 
 # ======================================================================
@@ -87,6 +87,7 @@ class TestPanelConstants:
         assert PANEL_X == 8
 
     def test_panel_y_below_status_badge(self) -> None:
+        pytest.importorskip('PyQt6')
         # PANEL_Y must be > the CP-1 status badge's bottom so the two
         # don't overlap.
         from overlay.debug_panel import PANEL_Y
@@ -460,6 +461,10 @@ class TestGestureStateSafeRead:
 # ======================================================================
 
 class TestOverlayWindowDeveloperMode:
+    pytestmark = pytest.mark.skipif(
+        not PYQT6_AVAILABLE, reason='PyQt6 not installed'
+    )
+
     """The OverlayWindow must gate the debug panel on
     `settings.developer_mode`.
 
@@ -566,6 +571,7 @@ class TestGestureOSAppWiring:
     """
 
     def test_start_passes_settings_to_overlay_window(self) -> None:
+        pytest.importorskip('PyQt6')
         from PyQt6.QtWidgets import QApplication
         import sys
         app = QApplication.instance() or QApplication(sys.argv)

@@ -16,7 +16,6 @@ scale-invariant by construction (ratio of vectors, not absolute pixels).
 from __future__ import annotations
 
 import math
-from typing import Iterable
 
 
 # ---------------------------------------------------------------------------

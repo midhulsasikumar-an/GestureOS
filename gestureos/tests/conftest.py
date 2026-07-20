@@ -9,12 +9,15 @@ JSON under tests/fixtures/, never hardcoded inline across multiple files.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+PYQT6_AVAILABLE = importlib.util.find_spec('PyQt6') is not None
 
 
 _FIXTURE_DIR = Path(__file__).resolve().parent / 'fixtures'

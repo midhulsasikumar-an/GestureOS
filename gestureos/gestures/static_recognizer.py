@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable
 
 from gestures.gesture_utils import (
     INDEX_MCP,
@@ -61,7 +60,14 @@ logger = logging.getLogger('gestureos')
 
 #: Normalized thumb-index distance below which Pinch / OK Sign match
 #: (PRD §4.3 Pinch + OK Sign rule; PRD §5.2 worked example).
-PINCH_NORMALIZED_DISTANCE_THRESHOLD: float = 0.35
+#: Increased from 0.35 → 0.55 (CP-3 pinch audit): real-world
+#: MediaPipe landmark noise produces normalized distances of 0.15–0.35
+#: for a deliberate pinch; the previous 0.35 threshold required nearly
+#: overlapping tips (≤0.13) for the resulting confidence to clear the
+#: pipeline's 0.85 gate.  The secondary gates (alignment ≥0.85,
+#: remaining-fingers curled <2.0) prevent false positives from Open
+#: Palm (nd≈0.68) and Fist (nd≈0.67), which fall outside the new band.
+PINCH_NORMALIZED_DISTANCE_THRESHOLD: float = 0.55
 
 #: Average fingertip spread (normalized by palm_width) above which
 #: Open Palm matches. Tuned so a loosely-closed fist does not false-
@@ -304,7 +310,7 @@ def detect_pinch(hand: HandData) -> GestureResult | None:
 
     Three independent signals per PRD FR-MS-01:
       - normalized thumb-index distance (Priority 3): the primary
-        proximity check; must be below 0.35 hand-scales.
+        proximity check; must be below 0.55 hand-scales.
       - thumb-index alignment ratio (Priority 2): cosine similarity
         between the wrist→thumb-tip and wrist→index-tip direction
         vectors. A genuine pinching gesture has the two fingertips
@@ -340,13 +346,17 @@ def detect_pinch(hand: HandData) -> GestureResult | None:
         return None
 
     # Blended confidence: three binary gates cleared yields a floor of
-    # 0.6, plus the proximity gradient (0 at threshold, 1 at perfect
-    # contact) contributes up to 0.4 additional.
+    # 0.75, plus the proximity gradient (0 at threshold, 1 at perfect
+    # contact) contributes up to 0.25 additional. Raised from 0.6+0.4
+    # (CP-3 pinch audit): with the wider 0.55 threshold, the old formula
+    # dropped below the pipeline's 0.85 gate at nd > 0.20; the new
+    # floor+weight keeps confidence >=0.85 up to nd ~ 0.30, matching
+    # real-world natural pinch distances.
     distance_score = max(
         0.0,
         1.0 - normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD,
     )
-    confidence = 0.6 + 0.4 * distance_score
+    confidence = 0.75 + 0.25 * distance_score
 
     return GestureResult(
         gesture_name='pinch',
@@ -597,14 +607,14 @@ def detect_ok_sign(hand: HandData) -> GestureResult | None:
     if not (states['middle'] and states['ring'] and states['pinky']):
         return None
 
-    # Confidence: blended — 0.6 floor from the two binary gates
-    # (distance + finger-state) plus the proximity gradient up to 0.4
-    # additional (same structure as Pinch).
+    # Confidence: blended — 0.75 floor from the two binary gates
+    # (distance + finger-state) plus the proximity gradient up to 0.25
+    # additional (same structure as Pinch, CP-3 pinch audit).
     distance_score = max(
         0.0,
         1.0 - normalized_dist / PINCH_NORMALIZED_DISTANCE_THRESHOLD,
     )
-    confidence = 0.6 + 0.4 * distance_score
+    confidence = 0.75 + 0.25 * distance_score
 
     return GestureResult(
         gesture_name='ok_sign',

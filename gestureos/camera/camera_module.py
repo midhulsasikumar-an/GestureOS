@@ -7,7 +7,7 @@ on hard failure so callers can apply the 10-attempt/2s reconnect policy
 in one place.
 
 Default resolution is 1280x720 (matches the reference implementation in
-``handtrack/`` and gives MediaPipe enough pixel density to track both
+``archive/handtrack/`` and gives MediaPipe enough pixel density to track both
 hands stably through rotation and partial occlusion). The driver may
 negotiate a different actual resolution; ``read_frame()`` adapts and
 only resizes when needed (RULES §12.1).

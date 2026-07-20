@@ -38,9 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Iterable, Sequence
-
-from gestures.motion_history_service import MotionHistoryService
+from typing import Sequence
 from models.data_models import GestureResult
 
 

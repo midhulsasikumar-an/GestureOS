@@ -27,7 +27,6 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import replace
-from typing import Iterable
 
 from models.data_models import HandData, HandScale
 from gestures.gesture_utils import euclidean_distance, WRIST, INDEX_MCP, PINKY_MCP

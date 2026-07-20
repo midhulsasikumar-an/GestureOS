@@ -119,10 +119,7 @@ class GestureFuser:
         # ---------------------------------------------------------------
         # 1. If a MediaPipe candidate has confidence >=
         #    MEDIAPIPE_WIN_CONFIDENCE (0.80), it wins unconditionally
-        #    over all custom candidates for this role, *unless* a
-        #    custom candidate represents a more specific gesture that
-        #    the MP model tends to misclassify (e.g., MP classifies a
-        #    deliberate pinch as Thumb_Up).
+        #    over all custom candidates for this role.
         # 2. If MediaPipe exists but confidence < threshold, remove
         #    the MediaPipe candidate from consideration and let the
         #    custom recognizers compete among themselves.
@@ -134,25 +131,9 @@ class GestureFuser:
         ]
         if mp_candidates:
             mp = mp_candidates[0]
-            mp_should_win = mp.confidence >= MEDIAPIPE_WIN_CONFIDENCE
-
-            # Pinch exception: MediaPipe's model frequently classifies
-            # a deliberate pinch as Thumb_Up because both gestures
-            # share an extended-thumb + curled-fingers profile. When
-            # the custom recognizer detects pinch for the same role,
-            # it is the authoritative source — do not let MP override
-            # unconditionally.
-            if mp_should_win:
-                custom_names = {
-                    c.gesture_name for c in role_candidates
-                    if getattr(c, 'source', '') != 'mediapipe'
-                }
-                if mp.gesture_name == 'thumbs_up' and 'pinch' in custom_names:
-                    mp_should_win = False
-
-            if mp_should_win:
+            if mp.confidence >= MEDIAPIPE_WIN_CONFIDENCE:
                 return mp
-            # Low-confidence MP or exception: remove from consideration.
+            # Low-confidence MP: remove from consideration.
             remaining = [
                 c for c in role_candidates
                 if c.source != 'mediapipe'
