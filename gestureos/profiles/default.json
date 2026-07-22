@@ -1,0 +1,49 @@
+{
+    "id": "default",
+    "name": "Default Profile",
+    "is_default": true,
+    "mappings": [
+        {
+            "gesture": "open_palm",
+            "action_type": "system",
+            "params": {
+                "type": "show_desktop"
+            }
+        },
+        {
+            "gesture": "fist",
+            "action_type": "system",
+            "params": {
+                "type": "toggle_gesture_control"
+            }
+        },
+        {
+            "gesture": "thumbs_up",
+            "action_type": "keyboard",
+            "params": {
+                "key": "volume_up"
+            }
+        },
+        {
+            "gesture": "thumbs_down",
+            "action_type": "keyboard",
+            "params": {
+                "key": "volume_down"
+            }
+        },
+        {
+            "gesture": "pinch",
+            "action_type": "mouse",
+            "params": {
+                "action": "click"
+            }
+        },
+        {
+            "gesture": "peace_sign",
+            "action_type": "keyboard",
+            "params": {
+                "key": "media_play_pause"
+            }
+        }
+    ]
+}

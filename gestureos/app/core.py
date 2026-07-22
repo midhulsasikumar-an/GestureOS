@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
+from actions import CommandRouter, Executor, ProfileManager
+from actions.safety import ActionValidator
 from app.capture_thread import CaptureThread
 from camera.camera_module import CameraModule
 from diagnostics.camera_validator import CameraValidator
@@ -56,6 +59,9 @@ from tracking.primary_hand_filter import PrimaryHandFilter
 
 
 logger = logging.getLogger('gestureos')
+
+# Resolve the profiles directory relative to this file (app/core.py → <root>/profiles).
+_PROFILES_DIR = str(Path(__file__).resolve().parent.parent / 'profiles')
 
 
 class ActivationStateBridge(QObject):
@@ -177,6 +183,12 @@ class GestureOSApp:
         )
         self._activation_bridge = ActivationStateBridge(self.activation_gate)
 
+        # CP-5: Action-dispatch pipeline (wired in start()).
+        self._profile_mgr: ProfileManager | None = None
+        self._router: CommandRouter | None = None
+        self._executor: Executor | None = None
+        self._action_validator: ActionValidator | None = None
+
         # OverlayWindow is a QWidget — DO NOT construct it here.
         # It is built lazily in start() after QApplication is verified
         # to exist (Qt's QWidget requires an extant QApplication).
@@ -220,9 +232,14 @@ class GestureOSApp:
             'static_gesture_engine.custom_fallback', None,
         )
 
-        # Register ActionExecutorBase stub (concrete implementation
-        # arrives in CP-5+).
-        registry.register_executor('action_executor.windows', None)
+        # CP-5: register the concrete WindowsExecutor so the extension
+        # system can discover it.  The app also uses it directly via
+        # `_on_gesture_detected` — the registry gives plugin code a
+        # discovery path without importing the implementation.
+        from actions.executors.windows_executor import WindowsExecutor
+        registry.register_executor(
+            'action_executor.windows', WindowsExecutor,
+        )
 
         # Register ContextAdapterBase stub (concrete implementation
         # arrives in CP-5+).
@@ -271,23 +288,62 @@ class GestureOSApp:
     def _on_gesture_detected(self, results) -> None:
         """Receive cooldown-cleared gestures from the CaptureThread.
 
+        Routes each ``GestureResult`` through CP-5's action pipeline:
+          ``CommandRouter.route() → Executor.execute()``
+
         The ActivationGate.hold-timer is already fed inside
         CaptureThread._run_gesture_pipeline() from the conflict-
         resolved winners (before stability/cooldown filtering), so
-        this slot only notifies the activation bridge so the overlay
+        this slot also notifies the activation bridge so the overlay
         indicator can update on state changes.
 
-        The bridge is idempotent: it only re-emits `state_changed`
-        when the gate's state actually differs from the last emitted
-        state. This avoids a separate Qt signal wiring path for
-        every state transition while keeping the indicator responsive
-        within one paint cycle (~33 ms).
+        ``results`` is ``list[GestureResult]`` (possibly empty).
+        Each result is dispatched independently — two hands can
+        trigger two simultaneous actions.
 
-        `results` is `list[GestureResult]` (possibly empty) — not
-        needed by this slot directly but preserved so CP-5's
-        dispatch slot can consume it in a future checkpoint.
+        The dispatch path is hot-path safe: ``route()`` returns
+        ``None`` for unmapped gestures, and ``execute()`` never
+        raises (returns ``ActionResult`` on every path).
         """
         self._activation_bridge.on_pipeline_tick()
+        if not results:
+            return
+        profile = self._profile_mgr.get_default() if self._profile_mgr else None
+        for gesture in results:
+            try:
+                action = self._router.route(gesture, profile)
+            except Exception:
+                logger.exception(
+                    'dispatch_route',
+                    extra={'extras': {'gesture': gesture.gesture_name,
+                                      'role': gesture.hand_role}},
+                )
+                continue
+            if action is None:
+                continue
+            if self._action_validator is not None and not self._action_validator.is_safe(action):
+                logger.warning(
+                    'dispatch_blocked',
+                    extra={'extras': {'gesture': gesture.gesture_name,
+                                      'action_type': action.action_type,
+                                      'reason': self._action_validator.last_error}},
+                )
+                continue
+            try:
+                result = self._executor.execute(action)
+            except Exception:
+                logger.exception(
+                    'dispatch_exec',
+                    extra={'extras': {'action': str(action)}},
+                )
+                continue
+            if not result.success and result.error != 'noop':
+                logger.warning(
+                    'dispatch_fail',
+                    extra={'extras': {'gesture': gesture.gesture_name,
+                                      'action_type': action.action_type,
+                                      'error': result.error}},
+                )
 
     @staticmethod
     def _capture_thread_frame_now(results) -> float:
@@ -345,6 +401,13 @@ class GestureOSApp:
         # badge starts in the correct color (INACTIVE = grey).
         self._overlay.update_tracking_state(self.activation_gate.state.name)
         self._overlay.show()
+
+        # CP-5: initialise action-dispatch pipeline.
+        self._profile_mgr = ProfileManager(profiles_dir=_PROFILES_DIR)
+        self._profile_mgr.load_all()
+        self._router = CommandRouter()
+        self._executor = Executor()
+        self._action_validator = ActionValidator()
 
         self._capture_thread = CaptureThread(
             camera=self._camera,
