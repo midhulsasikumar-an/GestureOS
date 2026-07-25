@@ -166,6 +166,11 @@ class ActivationGate:
         # module-level globals).
         self._hold_start: float | None = None
         self._hold_gesture: str | None = None
+        # After a hold-based toggle fires, the user must release
+        # (non-toggle frame) before a new hold can start. This
+        # prevents INACTIVE↔ACTIVE flicker when the user sustains
+        # a toggle gesture past the hold-duration boundary.
+        self._hold_just_fired: bool = False
 
     # ------------------------------------------------------------------
     # Public API — gesture-driven transitions
@@ -210,8 +215,58 @@ class ActivationGate:
                 }},
             )
 
+    def frame_feed_gestures(self, gesture_names: list[str], now: float) -> None:
+        """Feed all ConflictResolver winners for a single frame.
+
+        Scans ``gesture_names`` for the first qualifying toggle gesture
+        (``open_palm``, or ``fist`` when ``enable_closed_fist``) and
+        feeds it exactly once.  If no qualifying gesture is found in
+        this frame, the hold timer is reset (non-qualifying frame).
+
+        This prevents a multi-hand scenario where one hand produces
+        a non-toggle gesture and the other produces a toggle gesture
+        in the *same* frame — the old per-winner ``for`` loop would
+        reset the hold on the first name, then restart it on the
+        second, starving the hold timer every frame.
+
+        Args:
+            gesture_names: per-frame list of conflict-resolved gesture
+                names (one per hand role, typically 0–2 entries).
+            now: current timestamp in seconds (``time.monotonic()``).
+        """
+        try:
+            self._frame_feed_gestures_impl(gesture_names, now)
+        except Exception as exc:  # noqa: BLE001 — hot-path, never raise
+            logger.error(
+                'activation',
+                extra={'extras': {
+                    'event': 'frame_feed_gestures_failed',
+                    'gesture_count': len(gesture_names),
+                    'error': str(exc),
+                }},
+            )
+
+    def _frame_feed_gestures_impl(
+        self, gesture_names: list[str], now: float,
+    ) -> None:
+        for name in gesture_names:
+            if self.is_toggle_gesture(name):
+                if self._hold_just_fired:
+                    # User is still holding a toggle gesture after a
+                    # state transition — ignore until release to avoid
+                    # immediate re-toggle flicker.
+                    return
+                self._feed_gesture_impl(name, now)
+                return
+        # No toggle gesture in this frame — non-qualifying frame.
+        # Reset the hold timer per TRD §5.3 and clear the
+        # just-fired flag so the next hold can start.
+        self._hold_start = None
+        self._hold_gesture = None
+        self._hold_just_fired = False
+
     def _feed_gesture_impl(self, gesture_name: str, now: float) -> None:
-        if not self._is_toggle_gesture(gesture_name):
+        if not         self.is_toggle_gesture(gesture_name):
             # Non-qualifying gesture: reset hold (TRD §5.3 — no
             # partial credit on interruption).
             self._hold_start = None
@@ -235,7 +290,7 @@ class ActivationGate:
                 else ActivationMethod(name='open_palm_hold')
             )
             hold_elapsed_ms = int(elapsed * 1000)
-            self._toggle_state(method, hold_elapsed_ms=hold_elapsed_ms)
+            self._toggle_state(method, hold_elapsed_ms=hold_elapsed_ms, hold_based=True)
 
     # ------------------------------------------------------------------
     # Public API — explicit transitions
@@ -270,6 +325,7 @@ class ActivationGate:
         self,
         method: ActivationMethod,
         hold_elapsed_ms: int | None = None,
+        hold_based: bool = False,
     ) -> None:
         """Common state-flip logic with structured logging.
 
@@ -281,6 +337,13 @@ class ActivationGate:
         `hold_elapsed_ms` includes the millisecond elapsed at the
         moment the hold satisfied — useful for manual verification
         that activation only fires after the configured duration.
+
+        Args:
+            hold_based: True when called from the hold-timer path
+                (``_feed_gesture_impl``). Only hold-based toggles set
+                ``_hold_just_fired`` because explicit toggles
+                (``toggle()``, keyboard shortcut) should not prevent
+                the next hold from starting.
         """
         previous = self.state
         new = (
@@ -291,6 +354,8 @@ class ActivationGate:
         self.state = new
         self._hold_start = None
         self._hold_gesture = None
+        if hold_based:
+            self._hold_just_fired = True
         extras: dict[str, object] = {
             'event': 'state_changed',
             'from': previous.value,
@@ -308,7 +373,7 @@ class ActivationGate:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _is_toggle_gesture(self, gesture_name: str) -> bool:
+    def is_toggle_gesture(self, gesture_name: str) -> bool:
         """Return True if `gesture_name` may drive a hold-based toggle."""
         if gesture_name == OPEN_PALM_GESTURE:
             return True

@@ -102,6 +102,7 @@ class CaptureThread(QThread):
     overlay renders "N/A" for all fields).
     """
     gesture_detected = pyqtSignal(object)
+    frame_gesture_names = pyqtSignal(object)
     camera_error = pyqtSignal(str)
     tracking_error = pyqtSignal(str)
     state_changed = pyqtSignal(bool)
@@ -531,11 +532,25 @@ class CaptureThread(QThread):
                 (time.monotonic() - t0) * 1000,
             )
 
-            # Feed the gate from every conflict-resolved winner
-            # (pre-gesture-gate). The gate must see every
-            # qualifying frame to run its hold-timer.
-            for winner in winners:
-                self._activation_gate.feed_gesture(winner.gesture_name, now)
+            # Emit frame-level gesture names for repeat tracking
+            # (pre-gesture-gate, so the tracker sees every frame even
+            # when StabilityFilter blocks re-emission).
+            winners_by_role: dict[str, str] = {}
+            for w in winners:
+                if w.gesture_name:
+                    winners_by_role[w.hand_role] = w.gesture_name
+            self.frame_gesture_names.emit(winners_by_role)
+
+            # Feed the gate with the set of conflict-resolved winners
+            # for this frame (pre-gesture-gate). Uses
+            # ``frame_feed_gestures`` so that only one feed decision
+            # is made per frame — preventing a multi-hand interleaving
+            # bug where a non-toggle winner from one hand resets the
+            # hold timer in the same frame that a toggle winner from
+            # the other hand starts it.
+            self._activation_gate.frame_feed_gestures(
+                [w.gesture_name for w in winners], now,
+            )
 
             # Apply GestureGate (StabilityFilter + CooldownFilter in one pass).
             self._cleared_results.clear()

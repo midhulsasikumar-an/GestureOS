@@ -27,12 +27,11 @@ logger = logging.getLogger('gestureos')
 #: provided. Each entry is a dict with the same shape as a profile
 #: mapping row.
 DEFAULT_MAPPINGS: list[dict[str, Any]] = [
-    {'gesture': 'open_palm',  'action_type': 'system',    'params': {'type': 'show_desktop'}},
-    {'gesture': 'fist',       'action_type': 'system',    'params': {'type': 'toggle_gesture_control'}},
     {'gesture': 'thumbs_up',  'action_type': 'keyboard',  'params': {'key': 'volume_up'}},
     {'gesture': 'thumbs_down','action_type': 'keyboard',  'params': {'key': 'volume_down'}},
     {'gesture': 'pinch',      'action_type': 'mouse',     'params': {'action': 'click'}},
-    {'gesture': 'peace_sign', 'action_type': 'keyboard',  'params': {'key': 'media_play_pause'}},
+    {'gesture': 'one_finger', 'action_type': 'keyboard',  'params': {'key': 'volume_up'}},
+    {'gesture': 'peace_sign', 'action_type': 'keyboard',  'params': {'key': 'volume_down'}},
 ]
 
 #: Required keys in a profile mapping dict.

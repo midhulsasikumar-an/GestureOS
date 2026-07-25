@@ -239,6 +239,211 @@ class TestHoldTimerSemantics:
 
 
 # ======================================================================
+# frame_feed_gestures — frame-level feed for multi-hand fix
+# ======================================================================
+
+class TestFrameFeedGestures:
+    def test_single_toggle_gesture_starts_hold(self) -> None:
+        gate = make_gate(hold_duration_s=1.0)
+        gate.frame_feed_gestures([OPEN_PALM_GESTURE], now=0.0)
+        assert gate.hold_in_progress is not None
+        assert gate.hold_in_progress[0] == OPEN_PALM_GESTURE
+
+    def test_multiple_winners_one_toggle(self) -> None:
+        """Non-toggle + toggle: only the toggle gesture is fed."""
+        gate = make_gate(hold_duration_s=1.0)
+        gate.frame_feed_gestures(['circular_motion', OPEN_PALM_GESTURE], now=0.0)
+        assert gate.hold_in_progress is not None
+        assert gate.hold_in_progress[0] == OPEN_PALM_GESTURE
+
+    def test_multiple_toggle_gestures_feeds_first(self) -> None:
+        """Two toggle gestures: only the first is fed (should be
+        impossible in practice, but guard against it)."""
+        gate = make_gate(hold_duration_s=1.0, enable_closed_fist=True)
+        gate.frame_feed_gestures([OPEN_PALM_GESTURE, CLOSED_FIST_GESTURE], now=0.0)
+        assert gate.hold_in_progress is not None
+        assert gate.hold_in_progress[0] == OPEN_PALM_GESTURE
+
+    def test_no_toggle_gesture_resets_hold(self) -> None:
+        """Only non-toggle gestures resets any in-progress hold."""
+        gate = make_gate(hold_duration_s=1.0)
+        # Start a hold.
+        gate.feed_gesture(OPEN_PALM_GESTURE, now=0.0)
+        assert gate.hold_in_progress is not None
+        # Frame with no toggle gesture resets it.
+        gate.frame_feed_gestures(['circular_motion', 'swipe_right'], now=0.5)
+        assert gate.hold_in_progress is None
+
+    def test_empty_list_resets_hold(self) -> None:
+        """Empty list (no hands detected) resets any in-progress hold."""
+        gate = make_gate(hold_duration_s=1.0)
+        gate.feed_gesture(OPEN_PALM_GESTURE, now=0.0)
+        assert gate.hold_in_progress is not None
+        gate.frame_feed_gestures([], now=0.5)
+        assert gate.hold_in_progress is None
+
+    def test_two_hand_scenario_hold_reaches_toggle(self) -> None:
+        """Reproduce the exact multi-hand bug: non-toggle + toggle
+        interleaved every frame for 60 frames. The hold timer must
+        reach 1.0s and toggle the gate to ACTIVE.
+
+        Before the fix, this scenario would never toggle because
+        the per-winner for-loop would reset the hold on the non-toggle
+        entry, then restart it on the toggle entry — every frame."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+        for _ in range(90):
+            gate.frame_feed_gestures(['circular_motion', OPEN_PALM_GESTURE], now)
+            now += step
+        # After 90 frames (~1.5 s), the hold should have satisfied
+        # the 1.0 s duration and toggled the gate.
+        assert gate.state == TrackingState.ACTIVE
+
+    def test_two_hand_single_hand_hold_still_works(self) -> None:
+        """Single-hand scenario: one toggle gesture per frame, same
+        as before the fix."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+        for _ in range(70):
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+        assert gate.state == TrackingState.ACTIVE
+
+    def test_frame_feed_hot_path_never_raises(self) -> None:
+        gate = make_gate()
+        gate.frame_feed_gestures([], now=0.0)  # empty list — no crash
+
+
+# ======================================================================
+# No flicker on sustained hold — _hold_just_fired release guard
+# ======================================================================
+
+class TestNoFlicker:
+    """After a hold-based toggle fires, the gate must not re-toggle
+    while the user continues holding the same toggle gesture."""
+
+    def test_sustained_hold_does_not_flicker(self) -> None:
+        """Hold open_palm for 3.0s — the gate must toggle exactly
+        once (at 1.0s) and remain in the new state."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+        # Track state transitions by inspecting state before/after.
+        states_before: list[TrackingState] = []
+        original_toggle = gate._toggle_state
+
+        def tracking_toggle(method, hold_elapsed_ms=None, hold_based=False):
+            states_before.append(gate.state)
+            original_toggle(method, hold_elapsed_ms=hold_elapsed_ms, hold_based=hold_based)
+
+        gate._toggle_state = tracking_toggle  # type: ignore[method-assign]
+
+        for _ in range(180):  # 3.0 s
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+
+        # Exactly one transition occurred (INACTIVE→ACTIVE at 1.0s).
+        assert len(states_before) == 1
+        assert states_before[0] == TrackingState.INACTIVE
+        assert gate.state == TrackingState.ACTIVE
+
+    def test_release_and_rehold_triggers_another_toggle(self) -> None:
+        """Toggle → release (non-toggle frame) → re-hold → toggle
+        back. The release resets _hold_just_fired so the second
+        hold can fire."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+
+        # Hold to toggle INACTIVE → ACTIVE.
+        for _ in range(70):
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+        assert gate.state == TrackingState.ACTIVE
+
+        # Release: non-toggle frame clears _hold_just_fired.
+        gate.frame_feed_gestures(['pinch'], now)
+        now += step
+        assert gate.hold_in_progress is None
+
+        # Re-hold to toggle ACTIVE → INACTIVE.
+        for _ in range(70):
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+        assert gate.state == TrackingState.INACTIVE
+
+    def test_empty_frame_clears_just_fired(self) -> None:
+        """An empty frame (no hands) after toggle clears
+        _hold_just_fired, allowing a subsequent hold to start."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+
+        # Hold to toggle INACTIVE → ACTIVE.
+        for _ in range(70):
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+        assert gate.state == TrackingState.ACTIVE
+
+        # Empty frame (no hands detected).
+        gate.frame_feed_gestures([], now)
+        now += step
+
+        # Re-hold should start fresh.
+        gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+        assert gate.hold_in_progress is not None
+
+    def test_frame_feed_gestures_ignores_toggle_after_hold_fired(self) -> None:
+        """After a hold-based toggle fires, frame_feed_gestures
+        must ignore subsequent toggle gestures until a non-toggle
+        frame resets _hold_just_fired.
+
+        Uses frame_feed_gestures throughout (the correct path)
+        so that _hold_just_fired is both set and checked at the
+        frame level."""
+        gate = make_gate(hold_duration_s=1.0)
+        step = 1.0 / 60.0
+        now = 0.0
+
+        # Hold to toggle INACTIVE → ACTIVE via frame_feed_gestures.
+        for _ in range(70):
+            gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+            now += step
+        assert gate.state == TrackingState.ACTIVE
+        # _hold_just_fired is now True.
+
+        # Continue feeding toggle gesture — frame_feed_gestures
+        # should ignore it (no new hold started).
+        gate.frame_feed_gestures([OPEN_PALM_GESTURE], now)
+        assert gate.hold_in_progress is None
+
+
+# ======================================================================
+# is_toggle_gesture public method
+# ======================================================================
+
+class TestIsToggleGesture:
+    def test_open_palm_is_toggle(self) -> None:
+        gate = make_gate()
+        assert gate.is_toggle_gesture(OPEN_PALM_GESTURE) is True
+
+    def test_fist_not_toggle_when_disabled(self) -> None:
+        gate = make_gate(enable_closed_fist=False)
+        assert gate.is_toggle_gesture(CLOSED_FIST_GESTURE) is False
+
+    def test_fist_is_toggle_when_enabled(self) -> None:
+        gate = make_gate(enable_closed_fist=True)
+        assert gate.is_toggle_gesture(CLOSED_FIST_GESTURE) is True
+
+    def test_other_gesture_not_toggle(self) -> None:
+        gate = make_gate()
+        assert gate.is_toggle_gesture('swipe_right') is False
+        assert gate.is_toggle_gesture('pinch') is False
+
+
+# ======================================================================
 # Hot-path-never-raises (RULES §6.4)
 # ======================================================================
 

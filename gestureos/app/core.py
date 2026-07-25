@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import logging
 import sys
+import time as _time
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal
+import pynput.keyboard
+
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from actions import CommandRouter, Executor, ProfileManager
@@ -44,10 +47,12 @@ from app.capture_thread import CaptureThread
 from camera.camera_module import CameraModule
 from diagnostics.camera_validator import CameraValidator
 from diagnostics.diagnostics_manager import DiagnosticsManager
+from actions.repeat_tracker import HeldGestureTracker
 from gestures.activation_gate import ActivationGate, TrackingState
 from gestures.gesture_fuser import GestureFuser
 from gestures.gesture_gate import GestureGate
 from gestures.static_gesture_engine import StaticGestureEngine
+from models.data_models import GestureResult
 from models.model_manager import ModelManager
 from overlay.overlay_window import OverlayWindow
 from settings.settings_manager import Settings, SettingsManager
@@ -188,6 +193,8 @@ class GestureOSApp:
         self._router: CommandRouter | None = None
         self._executor: Executor | None = None
         self._action_validator: ActionValidator | None = None
+        self._repeat_tracker: HeldGestureTracker | None = None
+        self._repeat_timer: QTimer | None = None
 
         # OverlayWindow is a QWidget — DO NOT construct it here.
         # It is built lazily in start() after QApplication is verified
@@ -195,6 +202,13 @@ class GestureOSApp:
         self._overlay: OverlayWindow | None = None
 
         self._capture_thread: CaptureThread | None = None
+
+        # CP-4 keyboard shortcut: Ctrl+Alt+G toggles activation.
+        # pynput runs on a daemon thread; the listener is started in
+        # start() and stopped in stop().
+        self._keyboard_listener: pynput.keyboard.Listener | None = None
+        self._ctrl_pressed: bool = False
+        self._alt_pressed: bool = False
 
     # -- Extension registry -------------------------------------------------
 
@@ -252,6 +266,7 @@ class GestureOSApp:
         assert self._overlay is not None
         self._capture_thread.frame_ready.connect(self._on_frame_ready)
         self._capture_thread.gesture_detected.connect(self._on_gesture_detected)
+        self._capture_thread.frame_gesture_names.connect(self._on_frame_gesture_names)
         self._capture_thread.camera_error.connect(self._on_camera_error)
         self._capture_thread.tracking_error.connect(self._on_tracking_error)
         self._capture_thread.state_changed.connect(self._on_state_changed)
@@ -308,8 +323,19 @@ class GestureOSApp:
         self._activation_bridge.on_pipeline_tick()
         if not results:
             return
+
+        # FR-AM-04: activation gestures are consumed exclusively by
+        # the ActivationGate hold-timer and must NOT be dispatched
+        # through CommandRouter.
+        non_activation = [
+            r for r in results
+            if not self.activation_gate.is_toggle_gesture(r.gesture_name)
+        ]
+        if not non_activation:
+            return
+
         profile = self._profile_mgr.get_default() if self._profile_mgr else None
-        for gesture in results:
+        for gesture in non_activation:
             try:
                 action = self._router.route(gesture, profile)
             except Exception:
@@ -344,6 +370,83 @@ class GestureOSApp:
                                       'action_type': action.action_type,
                                       'error': result.error}},
                 )
+            else:
+                logger.info(
+                    'action_dispatched',
+                    extra={'extras': {
+                        'event': 'action_dispatched',
+                        'gesture': gesture.gesture_name,
+                        'action_type': action.action_type,
+                        'params': action.params,
+                    }},
+                )
+
+    def _on_frame_gesture_names(self, names_by_role: dict[str, str]) -> None:
+        """Receive frame-level gesture names for repeat tracking
+        (pre-gesture-gate, from CaptureThread).
+
+        Feeds the HeldGestureTracker so it can determine when repeat
+        actions should fire for held gestures."""
+        if self._repeat_tracker is not None:
+            self._repeat_tracker.feed_frame(names_by_role, _time.monotonic())
+
+    def _on_repeat_tick(self) -> None:
+        """QTimer callback: dispatch repeat actions for gestures that
+        have been held long enough.
+
+        Only fires when the activation gate is ACTIVE so repeat
+        actions never leak through an INACTIVE gate."""
+        if (
+            self._repeat_tracker is None
+            or self._router is None
+            or self._executor is None
+        ):
+            return
+        if self.activation_gate.state != TrackingState.ACTIVE:
+            return
+
+        now = _time.monotonic()
+        profile = self._profile_mgr.get_default() if self._profile_mgr else None
+        for role, name in self._repeat_tracker.get_ready_repeats(now):
+            gesture = GestureResult(
+                gesture_name=name,
+                confidence=1.0,
+                is_dynamic=False,
+                hand_role=role,
+                timestamp=now,
+            )
+            try:
+                action = self._router.route(gesture, profile)
+            except Exception:
+                logger.exception(
+                    'repeat_route',
+                    extra={'extras': {'gesture': name, 'role': role}},
+                )
+                continue
+            if action is None:
+                continue
+            if (
+                self._action_validator is not None
+                and not self._action_validator.is_safe(action)
+            ):
+                continue
+            try:
+                result = self._executor.execute(action)
+            except Exception:
+                logger.exception(
+                    'repeat_exec',
+                    extra={'extras': {'gesture': name, 'action': str(action)}},
+                )
+                continue
+            if not result.success and result.error != 'noop':
+                logger.warning(
+                    'repeat_fail',
+                    extra={'extras': {
+                        'gesture': name,
+                        'action_type': action.action_type,
+                        'error': result.error,
+                    }},
+                )
 
     @staticmethod
     def _capture_thread_frame_now(results) -> float:
@@ -373,6 +476,43 @@ class GestureOSApp:
             'app',
             extra={'extras': {'event': 'capture_thread_state', 'running': running}},
         )
+
+    # -- Keyboard shortcut (Ctrl+Alt+G) -------------------------------------
+
+    def _on_key_press(self, key: pynput.keyboard.Key | pynput.keyboard.KeyCode | None) -> None:
+        try:
+            if key in (pynput.keyboard.Key.ctrl_l, pynput.keyboard.Key.ctrl_r):
+                self._ctrl_pressed = True
+            elif key in (pynput.keyboard.Key.alt_l, pynput.keyboard.Key.alt_r):
+                self._alt_pressed = True
+            elif isinstance(key, pynput.keyboard.KeyCode) and key.char == 'g':
+                if self._ctrl_pressed and self._alt_pressed:
+                    self.activation_gate.toggle()
+        except AttributeError:
+            pass
+
+    def _on_key_release(self, key: pynput.keyboard.Key | pynput.keyboard.KeyCode | None) -> None:
+        try:
+            if key in (pynput.keyboard.Key.ctrl_l, pynput.keyboard.Key.ctrl_r):
+                self._ctrl_pressed = False
+            elif key in (pynput.keyboard.Key.alt_l, pynput.keyboard.Key.alt_r):
+                self._alt_pressed = False
+        except AttributeError:
+            pass
+
+    def _start_keyboard_listener(self) -> None:
+        self._ctrl_pressed = False
+        self._alt_pressed = False
+        self._keyboard_listener = pynput.keyboard.Listener(
+            on_press=self._on_key_press,
+            on_release=self._on_key_release,
+        )
+        self._keyboard_listener.start()
+
+    def _stop_keyboard_listener(self) -> None:
+        if self._keyboard_listener is not None:
+            self._keyboard_listener.stop()
+            self._keyboard_listener = None
 
     # -- Public lifecycle ----------------------------------------------------
 
@@ -409,6 +549,13 @@ class GestureOSApp:
         self._executor = Executor()
         self._action_validator = ActionValidator()
 
+        # CP-5 repeat tracker: fires repeat actions for held gestures
+        # at a controlled rate (initial delay 500 ms, then every 250 ms).
+        self._repeat_tracker = HeldGestureTracker()
+        self._repeat_timer = QTimer()
+        self._repeat_timer.timeout.connect(self._on_repeat_tick)
+        self._repeat_timer.start(100)
+
         self._capture_thread = CaptureThread(
             camera=self._camera,
             tracking=self._tracking,
@@ -424,10 +571,17 @@ class GestureOSApp:
             activation_gate=self.activation_gate,
         )
         self._wire_capture_signals()
+        self._start_keyboard_listener()
         self._capture_thread.start()
 
     def stop(self) -> None:
-        """Stop the capture thread and close the overlay."""
+        """Stop the capture thread, keyboard listener, repeat timer,
+        and close the overlay."""
+        if self._repeat_timer is not None:
+            self._repeat_timer.stop()
+            self._repeat_timer = None
+        self._repeat_tracker = None
+        self._stop_keyboard_listener()
         if self._capture_thread is not None and self._capture_thread.isRunning():
             self._capture_thread.stop()
             self._capture_thread.wait(3000)

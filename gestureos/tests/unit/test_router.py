@@ -56,21 +56,6 @@ def make_profile(
 class TestDefaultMappings:
     """When no profile is provided, the router uses its default mappings."""
 
-    def test_open_palm_routes_to_system(self) -> None:
-        router = CommandRouter()
-        action = router.route(make_gesture('open_palm'))
-        assert action is not None
-        assert action.action_type == 'system'
-        assert action.params == {'type': 'show_desktop'}
-        assert action.gesture_name == 'open_palm'
-
-    def test_fist_routes_to_toggle_gesture_control(self) -> None:
-        router = CommandRouter()
-        action = router.route(make_gesture('fist'))
-        assert action is not None
-        assert action.action_type == 'system'
-        assert action.params == {'type': 'toggle_gesture_control'}
-
     def test_thumbs_up_routes_to_keyboard(self) -> None:
         router = CommandRouter()
         action = router.route(make_gesture('thumbs_up'))
@@ -92,12 +77,29 @@ class TestDefaultMappings:
         assert action.action_type == 'mouse'
         assert action.params == {'action': 'click'}
 
-    def test_peace_sign_routes_to_keyboard(self) -> None:
+    def test_one_finger_routes_to_volume_up(self) -> None:
+        router = CommandRouter()
+        action = router.route(make_gesture('one_finger'))
+        assert action is not None
+        assert action.action_type == 'keyboard'
+        assert action.params == {'key': 'volume_up'}
+
+    def test_peace_sign_routes_to_volume_down(self) -> None:
         router = CommandRouter()
         action = router.route(make_gesture('peace_sign'))
         assert action is not None
         assert action.action_type == 'keyboard'
-        assert action.params == {'key': 'media_play_pause'}
+        assert action.params == {'key': 'volume_down'}
+
+    def test_open_palm_returns_none(self) -> None:
+        router = CommandRouter()
+        action = router.route(make_gesture('open_palm'))
+        assert action is None
+
+    def test_fist_returns_none(self) -> None:
+        router = CommandRouter()
+        action = router.route(make_gesture('fist'))
+        assert action is None
 
 
 # ======================================================================
@@ -128,11 +130,11 @@ class TestProfilePriority:
     def test_profile_mapping_overrides_default(self) -> None:
         router = CommandRouter()
         profile = make_profile(mappings=[
-            {'gesture': 'open_palm', 'action_type': 'mouse', 'params': {'action': 'click'}},
+            {'gesture': 'thumbs_up', 'action_type': 'mouse', 'params': {'action': 'click'}},
         ])
-        action = router.route(make_gesture('open_palm'), profile=profile)
+        action = router.route(make_gesture('thumbs_up'), profile=profile)
         assert action is not None
-        # Profile takes priority over the default 'system' action.
+        # Profile takes priority over the default 'keyboard' action.
         assert action.action_type == 'mouse'
         assert action.params == {'action': 'click'}
 
@@ -141,18 +143,18 @@ class TestProfilePriority:
         profile = make_profile(mappings=[
             {'gesture': 'pinch', 'action_type': 'mouse', 'params': {'action': 'click'}},
         ])
-        action = router.route(make_gesture('open_palm'), profile=profile)
+        action = router.route(make_gesture('thumbs_up'), profile=profile)
         assert action is not None
-        # Profile doesn't have 'open_palm' — fall back to default.
-        assert action.action_type == 'system'
-        assert action.params == {'type': 'show_desktop'}
+        # Profile doesn't have 'thumbs_up' — fall back to default.
+        assert action.action_type == 'keyboard'
+        assert action.params == {'key': 'volume_up'}
 
     def test_profile_empty_falls_back(self) -> None:
         router = CommandRouter()
         profile = make_profile(mappings=[])
-        action = router.route(make_gesture('open_palm'), profile=profile)
+        action = router.route(make_gesture('thumbs_up'), profile=profile)
         assert action is not None
-        assert action.action_type == 'system'
+        assert action.action_type == 'keyboard'
 
     def test_profile_missing_gesture_in_profile_only(self) -> None:
         router = CommandRouter()
@@ -242,11 +244,11 @@ class TestCustomMappings:
     def test_custom_overrides_defaults(self) -> None:
         # Providing custom mappings replaces the defaults entirely.
         router = CommandRouter(mappings=[
-            {'gesture': 'open_palm', 'action_type': 'mouse', 'params': {'action': 'click'}},
+            {'gesture': 'thumbs_up', 'action_type': 'mouse', 'params': {'action': 'click'}},
         ])
-        # Only 'open_palm' is mapped.
-        assert router.route(make_gesture('open_palm')) is not None
-        assert router.route(make_gesture('fist')) is None
+        # Only 'thumbs_up' is mapped.
+        assert router.route(make_gesture('thumbs_up')) is not None
+        assert router.route(make_gesture('pinch')) is None
 
 
 # ======================================================================
@@ -258,7 +260,7 @@ class TestStateless:
 
     def test_route_does_not_mutate_gesture(self) -> None:
         router = CommandRouter()
-        gesture = make_gesture('open_palm')
+        gesture = make_gesture('thumbs_up')
         original_name = gesture.gesture_name
         router.route(gesture)
         assert gesture.gesture_name == original_name
@@ -266,11 +268,11 @@ class TestStateless:
     def test_route_does_not_mutate_profile(self) -> None:
         router = CommandRouter()
         profile = make_profile(mappings=[
-            {'gesture': 'open_palm', 'action_type': 'mouse', 'params': {'action': 'click'}},
+            {'gesture': 'thumbs_up', 'action_type': 'mouse', 'params': {'action': 'click'}},
         ])
         original_count = len(profile.mappings)
-        router.route(make_gesture('open_palm'), profile=profile)
-        router.route(make_gesture('fist'), profile=profile)
+        router.route(make_gesture('thumbs_up'), profile=profile)
+        router.route(make_gesture('pinch'), profile=profile)
         assert len(profile.mappings) == original_count
 
 
@@ -283,7 +285,7 @@ class TestActionShape:
 
     def test_action_has_all_fields(self) -> None:
         router = CommandRouter()
-        action = router.route(make_gesture('open_palm'))
+        action = router.route(make_gesture('thumbs_up'))
         assert action is not None
         # Required fields from data_models.Action
         assert hasattr(action, 'action_type')
@@ -308,7 +310,7 @@ class TestActionShape:
         # valid entries (every gesture recognisable by the system).
         from actions.router import DEFAULT_MAPPINGS
         valid_gestures = {
-            'open_palm', 'fist', 'pinch', 'thumbs_up', 'thumbs_down',
+            'thumbs_up', 'thumbs_down', 'pinch', 'one_finger',
             'peace_sign', 'three_fingers', 'ok_sign',
         }
         for m in DEFAULT_MAPPINGS:

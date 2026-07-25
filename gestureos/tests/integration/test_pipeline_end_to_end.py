@@ -114,8 +114,9 @@ class Pipeline:
         candidates = self.gesture_engine.evaluate(filtered, now)
         winners = self.gesture_fuser.resolve(candidates)
 
-        for winner in winners:
-            self.activation_gate.feed_gesture(winner.gesture_name, now)
+        self.activation_gate.frame_feed_gestures(
+            [w.gesture_name for w in winners], now,
+        )
 
         cleared = self.gesture_gate.process(winners, now)
 
@@ -124,6 +125,13 @@ class Pipeline:
         # frames and toggle itself to ACTIVE.
         if self.activation_gate.state != TrackingState.ACTIVE:
             cleared = []
+
+        # FR-AM-04: activation gestures are consumed exclusively by
+        # the ActivationGate hold-timer and must NOT be dispatched.
+        cleared = [
+            r for r in cleared
+            if not self.activation_gate.is_toggle_gesture(r.gesture_name)
+        ]
 
         # CP-5 dispatch path (mocked).
         for result in cleared:
@@ -195,29 +203,97 @@ class TestGesturesIgnoredWhileInactive:
 # ======================================================================
 
 class TestPipelineFiresWhileActive:
-    def test_open_palm_sequence_reaches_dispatch_when_active(self) -> None:
+    def test_non_activation_gesture_reaches_dispatch_when_active(self) -> None:
+        """A non-activation gesture (pinch) must reach the dispatch
+        sink when the gate is ACTIVE."""
         pipeline = Pipeline()
 
         # Force the gate to ACTIVE without relying on the hold-timer.
         pipeline.activation_gate.toggle()
         assert pipeline.activation_gate.state == TrackingState.ACTIVE
 
-        # Feed an open-palm hand for ~300 ms — past the 200 ms
-        # stability window. StabilityFilter should emit once; the
-        # dispatch sink records exactly one call.
+        # Feed a pinch hand for ~300 ms. Pinch is NOT an activation
+        # gesture and must be dispatched.
+        now = 0.0
+        for i in range(15):
+            hand = make_hand_with_scale(
+                pose_name='pinch_right',
+                chirality='Right',
+                confidence=0.95,
+                role='HAND_A',
+                hand_scale=0.10,
+            )
+            pipeline.tick(raw_hands=[hand], now=now)
+            now += 0.033
+
+        # At least one dispatch happened (pinch passed stability +
+        # cooldown and is not an activation gesture).
+        assert pipeline.dispatch_sink.call_count >= 1
+        names = [call.args[0].gesture_name for call in pipeline.dispatch_sink.call_args_list]
+        assert 'pinch' in names
+
+    def test_open_palm_not_dispatched_when_active(self) -> None:
+        """Open palm is an activation gesture and must NOT reach
+        the dispatch sink even when the gate is ACTIVE."""
+        pipeline = Pipeline()
+        pipeline.activation_gate.toggle()
+        assert pipeline.activation_gate.state == TrackingState.ACTIVE
+
         now = 0.0
         for i in range(15):
             hand = make_open_palm_hand(role='HAND_A', now=now)
             pipeline.tick(raw_hands=[hand], now=now)
             now += 0.033
 
-        # At least one dispatch happened (the open_palm candidate
-        # passed stability + cooldown).
+        # Open palm is an activation gesture — it must NOT be
+        # dispatched through CommandRouter.
+        pipeline.dispatch_sink.assert_not_called()
+
+    def test_thumbs_up_not_filtered_when_active(self) -> None:
+        """Thumbs up is NOT an activation gesture and must reach
+        the dispatch sink with volume_up when the gate is ACTIVE."""
+        pipeline = Pipeline()
+        pipeline.activation_gate.toggle()
+        assert pipeline.activation_gate.state == TrackingState.ACTIVE
+
+        now = 0.0
+        for i in range(15):
+            hand = make_hand_with_scale(
+                pose_name='thumbs_up_right',
+                chirality='Right',
+                confidence=0.95,
+                role='HAND_A',
+                hand_scale=0.10,
+            )
+            pipeline.tick(raw_hands=[hand], now=now)
+            now += 0.033
+
         assert pipeline.dispatch_sink.call_count >= 1
-        # The dispatched gesture name should be open_palm (the
-        # recognizer's canonical name).
         names = [call.args[0].gesture_name for call in pipeline.dispatch_sink.call_args_list]
-        assert 'open_palm' in names
+        assert 'thumbs_up' in names
+
+    def test_pinch_dispatched_when_active(self) -> None:
+        """Pinch is not an activation gesture and must reach the
+        dispatch sink with mouse click when the gate is ACTIVE."""
+        pipeline = Pipeline()
+        pipeline.activation_gate.toggle()
+        assert pipeline.activation_gate.state == TrackingState.ACTIVE
+
+        now = 0.0
+        for i in range(15):
+            hand = make_hand_with_scale(
+                pose_name='pinch_right',
+                chirality='Right',
+                confidence=0.95,
+                role='HAND_A',
+                hand_scale=0.10,
+            )
+            pipeline.tick(raw_hands=[hand], now=now)
+            now += 0.033
+
+        assert pipeline.dispatch_sink.call_count >= 1
+        names = [call.args[0].gesture_name for call in pipeline.dispatch_sink.call_args_list]
+        assert 'pinch' in names
 
 
 # ======================================================================
@@ -295,16 +371,16 @@ class TestPipelineOrdering:
         pipeline.activation_gate.toggle()  # force ACTIVE
         assert pipeline.activation_gate.state == TrackingState.ACTIVE
 
-        # Track how many feed_gesture calls the gate receives.
+        # Track how many frame_feed_gestures calls the gate receives.
         feed_count = 0
-        original_feed = pipeline.activation_gate.feed_gesture
+        original_feed = pipeline.activation_gate.frame_feed_gestures
 
-        def counting_feed(name: str, t: float) -> None:
+        def counting_feed(names: list[str], t: float) -> None:
             nonlocal feed_count
             feed_count += 1
-            original_feed(name, t)
+            original_feed(names, t)
 
-        pipeline.activation_gate.feed_gesture = counting_feed  # type: ignore[method-assign]
+        pipeline.activation_gate.frame_feed_gestures = counting_feed  # type: ignore[method-assign]
 
         now = 0.0
         for _ in range(30):
