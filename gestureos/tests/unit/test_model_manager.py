@@ -238,6 +238,25 @@ class TestRecognizeGesture:
         result = mgr.recognize_gesture([(0.5, 0.5, 0.0)] * 21)
         assert result is None
 
+    def test_pointing_up_maps_to_one_finger(self, mgr) -> None:
+        """Regression: MediaPipe Pointing_Up must route as one_finger
+        so the CommandRouter finds the profile mapping. CP-5+ audit fix."""
+        mock_model = self._load_gesture_model(mgr)
+        self._set_latest_frame(mgr)
+
+        mock_category = MagicMock()
+        mock_category.category_name = 'Pointing_Up'
+        mock_category.score = 0.90
+        mock_result = MagicMock()
+        mock_result.gestures = [[mock_category]]
+        mock_model.recognize.return_value = mock_result
+
+        result = mgr.recognize_gesture([(0.5, 0.5, 0.0)] * 21)
+        assert result is not None
+        assert result.gesture_name == 'one_finger', (
+            f'Pointing_Up should map to one_finger, got {result.gesture_name!r}'
+        )
+
     def test_gesture_name_mapping_all_entries(self, mgr) -> None:
         mock_model = self._load_gesture_model(mgr)
         self._set_latest_frame(mgr)
@@ -462,6 +481,6 @@ class TestGestureMapping:
             'Thumb_Up': 'thumbs_up',
             'Thumb_Down': 'thumbs_down',
             'Victory': 'peace_sign',
-            'Pointing_Up': 'pointing_up',
+            'Pointing_Up': 'one_finger',  # CP-5+: normalize to canonical gesture name
         }
         assert _MP_TO_INTERNAL == expected

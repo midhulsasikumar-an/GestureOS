@@ -271,9 +271,9 @@ class TestThumbsUp:
         result = detect_thumbs_up(h)
         assert result is not None
         # Canonical fixture: thumb=0.9334, dir=0.7000
-        # new formula: 0.5 + 0.5 * (0.80*0.9334 + 0.20*0.7000) = 0.9434
-        assert round(result.confidence, 4) == 0.9434, (
-            f'Expected 0.9434, got {result.confidence}'
+        # new formula (CP-5+ audit): 0.75 + 0.25 * (0.80*0.9334 + 0.20*0.7000) = 0.9717
+        assert round(result.confidence, 4) == 0.9717, (
+            f'Expected 0.9717, got {result.confidence}'
         )
 
     def test_thumbs_up_confidence_tolerates_moderate_direction(
@@ -292,9 +292,9 @@ class TestThumbsUp:
         ):
             result = detect_thumbs_up(h)
         assert result is not None
-        # 0.5 + 0.5 * (0.80 * 0.814 + 0.20 * 0.354) = 0.861
-        assert round(result.confidence, 4) == 0.8610, (
-            f'Expected 0.8610, got {result.confidence}'
+        # 0.75 + 0.25 * (0.80 * 0.814 + 0.20 * 0.354) = 0.75 + 0.1805 = 0.9305
+        assert round(result.confidence, 4) == 0.9305, (
+            f'Expected 0.9305, got {result.confidence}'
         )
 
     def test_thumbs_up_confidence_does_not_overweight_direction(
@@ -314,14 +314,66 @@ class TestThumbsUp:
         ):
             result = detect_thumbs_up(h)
         assert result is not None
-        # 0.5 + 0.5 * (0.80 * 0.814 + 0.20 * 0.05) = 0.830
-        # Still below 0.85 threshold — the binary gate would have
-        # already let this through (dir > 0.0), but the secondary
-        # confidence check ensures very poor direction doesn't
-        # produce a strongly confident result.
-        assert round(result.confidence, 4) == 0.8306, (
-            f'Expected 0.8306, got {result.confidence}'
+        # 0.75 + 0.25 * (0.80 * 0.814 + 0.20 * 0.05) = 0.75 + 0.1653 = 0.9153
+        # Raised floor ensures even poor-direction cases clear the
+        # 0.85 pipeline threshold once both binary gates pass.
+        assert round(result.confidence, 4) == 0.9153, (
+            f'Expected 0.9153, got {result.confidence}'
         )
+
+    def test_thumbs_up_clears_085_threshold_at_minimum_valid_input(self) -> None:
+        """Regression: a thumbs-up at the binary-gate boundary
+        (thumb_score = 0.55, direction_score just above 0) must
+        produce confidence ≥ 0.85."""
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.thumb_extension_score',
+            return_value=0.550,
+        ), mock.patch(
+            'gestures.static_recognizer.thumb_direction_score',
+            return_value=0.001,
+        ):
+            result = detect_thumbs_up(h)
+        assert result is not None
+        # 0.75 + 0.25 * (0.80 * 0.550 + 0.20 * 0.001) = 0.75 + 0.11005 = 0.86005
+        assert result.confidence >= 0.85, (
+            f'Minimum-valid thumbs_up confidence {result.confidence:.4f} '
+            f'below pipeline threshold 0.85'
+        )
+
+    def test_thumbs_up_clears_085_threshold_with_typical_extension(self) -> None:
+        """A typical thumbs-up with moderate scores must clear the
+        pipeline threshold comfortably."""
+        import unittest.mock as mock
+        h = make_hand_with_scale(pose_name='thumbs_up_right', role='HAND_A')
+        with mock.patch(
+            'gestures.static_recognizer.thumb_extension_score',
+            return_value=0.70,
+        ), mock.patch(
+            'gestures.static_recognizer.thumb_direction_score',
+            return_value=0.60,
+        ):
+            result = detect_thumbs_up(h)
+        assert result is not None
+        # 0.75 + 0.25 * (0.80 * 0.70 + 0.20 * 0.60) = 0.75 + 0.17 = 0.92
+        assert result.confidence >= 0.85
+
+    def test_fist_rejected_by_thumbs_up_regression(self) -> None:
+        """A fist must not produce a thumbs_up candidate (regression
+        guard: confidence formula change must not create false positives)."""
+        h = make_hand_with_scale(pose_name='fist_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_open_palm_rejected_by_thumbs_up_regression(self) -> None:
+        """An open palm must not produce a thumbs_up candidate."""
+        h = make_hand_with_scale(pose_name='open_palm_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
+
+    def test_pinch_rejected_by_thumbs_up_regression(self) -> None:
+        """A pinch must not produce a thumbs_up candidate."""
+        h = make_hand_with_scale(pose_name='pinch_right', role='HAND_A')
+        assert detect_thumbs_up(h) is None
 
 
     # ------------------------------------------------------------------

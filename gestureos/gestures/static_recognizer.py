@@ -415,15 +415,14 @@ def detect_thumbs_up(hand: HandData) -> GestureResult | None:
     if norm_dist < PINCH_NORMALIZED_DISTANCE_THRESHOLD:
         return None
 
-    # Confidence blends extension strength (dominant) with direction clarity
-    # (secondary modifier).  Direction no longer multiplies the entire
-    # variable contribution — moderate direction (≈0.3–0.6) no longer
-    # heavily punishes an otherwise correct thumbs-up.
-    #
-    # Structure: 50% floor + variable portion split 80/20 between
-    # extension and direction.  This gives thumb_score ≈4× the weight of
-    # direction_score in the final confidence.
-    confidence = 0.5 + 0.5 * (0.80 * thumb_score + 0.20 * direction_score)
+    # Confidence structure (CP-5+ audit fix): 75% binary-gate floor
+    # + 25% variable portion split 80/20 between extension and direction.
+    # The raised floor ensures that any gesture passing both binary gates
+    # (thumb_score ≥ 0.55, direction_score > 0.0) reliably exceeds the
+    # pipeline's 0.85 confidence threshold, analogous to the CP-3 pinch
+    # confidence adjustment.  The 80/20 split preserves ~4× extension
+    # weight over direction.
+    confidence = 0.75 + 0.25 * (0.80 * thumb_score + 0.20 * direction_score)
 
     return GestureResult(
         gesture_name='thumbs_up',

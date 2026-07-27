@@ -602,6 +602,6 @@ _MP_TO_INTERNAL: dict[str, str] = {
     'Thumb_Up': 'thumbs_up',
     'Thumb_Down': 'thumbs_down',
     'Victory': 'peace_sign',
-    'Pointing_Up': 'pointing_up',
+    'Pointing_Up': 'one_finger',  # normalize to canonical gesture name
 }
 
